@@ -1,0 +1,41 @@
+name: Monitor STJ · Atualizar Painel
+ 
+on:
+  # Roda toda segunda-feira às 07:00 horário de Brasília (10:00 UTC)
+  schedule:
+    - cron: '0 10 * * 1'
+ 
+  # Permite rodar manualmente pela aba "Actions" no GitHub
+  workflow_dispatch:
+ 
+jobs:
+  coletar-e-publicar:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # necessário para fazer commit do HTML gerado
+ 
+    steps:
+      - name: 📥 Baixar repositório
+        uses: actions/checkout@v4
+ 
+      - name: 🐍 Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+ 
+      - name: 🔍 Coletar processos e gerar HTML
+        env:
+          DATAJUD_API_KEY: ${{ secrets.DATAJUD_API_KEY }}
+        run: python scripts/coletar_stj.py
+ 
+      - name: 💾 Publicar HTML atualizado
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add stj/index.html
+          # Só commita se o arquivo mudou (evita commits vazios)
+          git diff --staged --quiet && echo "Sem mudanças." || (
+            git commit -m "Monitor STJ: atualização $(date +'%d/%m/%Y %H:%M') BRT"
+            git push
+          )
+ 
