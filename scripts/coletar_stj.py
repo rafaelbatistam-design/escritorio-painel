@@ -1,14 +1,12 @@
 #!/usr/bin/env python3
 """
 Monitor STJ — Marquez Advogados
-Gera stj/data.json e stj/index.html para GitHub Pages.
-JSON separado do HTML elimina qualquer risco de quebra de JavaScript.
+Gera stj/data.js (carregado via <script src>) e stj/index.html
 """
  
 import json, os, sys, time, urllib.request, urllib.error, urllib.parse
 from datetime import datetime, date, timedelta
  
-# ── Configuração ──────────────────────────────────────────────────────────────
 API_KEY = os.environ.get("DATAJUD_API_KEY", "")
 API_URL = "https://api-publica.datajud.cnj.jus.br/api_publica_stj/_search"
  
@@ -56,8 +54,7 @@ MOV_PAUTADO     = 417
 MOV_DISTRIBUIDO = 26
 MOV_CONCLUSO    = 51
 CODIGOS_CANCEL  = {12106, 897, 193}
- 
-AREAS_EXCLUIR = {"Tributário / Fiscal", "Trabalhista / Previdenciário"}
+AREAS_EXCLUIR   = {"Tributário / Fiscal", "Trabalhista / Previdenciário"}
  
 AREAS = {
     "Empresarial / Societário": [
@@ -116,7 +113,6 @@ AREAS = {
     ],
 }
  
-# ── Utilitários ───────────────────────────────────────────────────────────────
 def log(msg):
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", file=sys.stderr)
  
@@ -128,65 +124,53 @@ def classificar_area(texto):
     return "Outros / Verificar"
  
 def extrair_assuntos(assuntos):
-    if not assuntos:
-        return ""
+    if not assuntos: return ""
     nomes = []
     for a in assuntos[:4]:
-        if isinstance(a, dict):
-            nomes.append(a.get("nome", ""))
-        elif isinstance(a, str):
-            nomes.append(a)
+        if isinstance(a, dict): nomes.append(a.get("nome", ""))
+        elif isinstance(a, str): nomes.append(a)
     return "; ".join(n for n in nomes if n)
  
 def analisar_pauta(movimentos):
-    if not movimentos:
-        return "sem_pauta", ""
+    if not movimentos: return "sem_pauta", ""
     movs = sorted(movimentos, key=lambda m: m.get("dataHora", ""))
     ultimo_idx, ultima_data = None, ""
     for i, m in enumerate(movs):
         if m.get("codigo") == MOV_PAUTADO:
             ultima_data = m.get("dataHora", "")[:10]
             ultimo_idx  = i
-    if ultimo_idx is None:
-        return "sem_pauta", ""
+    if ultimo_idx is None: return "sem_pauta", ""
     for m in movs[ultimo_idx + 1:]:
         if m.get("codigo") in CODIGOS_CANCEL:
             return "cancelado", ultima_data
     return "pautado", ultima_data
  
 def data_mais_recente_mov(movimentos, codigo_mov):
-    datas = [m.get("dataHora", "")[:10]
-             for m in (movimentos or []) if m.get("codigo") == codigo_mov]
+    datas = [m.get("dataHora","")[:10] for m in (movimentos or []) if m.get("codigo") == codigo_mov]
     return max(datas) if datas else ""
  
 def calcular_urgencia(data_inclusao):
-    if not data_inclusao:
-        return "Baixa"
+    if not data_inclusao: return "Baixa"
     try:
         dias = (date.today() - datetime.strptime(data_inclusao, "%Y-%m-%d").date()).days
         if dias <= 7:  return "Alta"
         if dias <= 30: return "Média"
         return "Baixa"
-    except:
-        return "Baixa"
+    except: return "Baixa"
  
 def fmt_data(d):
-    if not d:
-        return ""
-    try:
-        return datetime.strptime(d[:10], "%Y-%m-%d").strftime("%d/%m/%Y")
-    except:
-        return d
+    if not d: return ""
+    try: return datetime.strptime(d[:10], "%Y-%m-%d").strftime("%d/%m/%Y")
+    except: return d
  
 def stj_link(numero):
     return ("https://processo.stj.jus.br/processo/pesquisa/"
             "?aplicacao=processos.ea&tipoPesquisa=tipoPesquisaNumeroUnico"
             f"&termo={urllib.parse.quote(numero)}")
  
-# ── API ───────────────────────────────────────────────────────────────────────
 def post_api(body):
     if not API_KEY:
-        log("ERRO: variável DATAJUD_API_KEY não definida.")
+        log("ERRO: DATAJUD_API_KEY não definida.")
         sys.exit(1)
     payload = json.dumps(body).encode("utf-8")
     req = urllib.request.Request(
@@ -205,7 +189,7 @@ def post_api(body):
         log(f"  Erro: {e}")
         return None
  
-def query_por_movimento(codigo_gabinete, codigo_mov, since_iso=None):
+def query(codigo_gabinete, codigo_mov, since_iso=None):
     must = [
         {"term": {"orgaoJulgador.codigo": codigo_gabinete}},
         {"term": {"movimentos.codigo": codigo_mov}},
@@ -215,125 +199,104 @@ def query_por_movimento(codigo_gabinete, codigo_mov, since_iso=None):
     return post_api({
         "size": 200,
         "query": {"bool": {"must": must}},
-        "_source": ["numeroProcesso", "classe", "orgaoJulgador",
-                    "assuntos", "movimentos", "dataAjuizamento"],
+        "_source": ["numeroProcesso","classe","orgaoJulgador",
+                    "assuntos","movimentos","dataAjuizamento"],
         "sort": [{"dataAjuizamento": {"order": "desc"}}],
     })
  
-# ── Coleta ────────────────────────────────────────────────────────────────────
 def coletar():
-    pautados    = []
-    distribuidos = []
-    conclusos   = []
-    vistos      = set()
+    pautados, distribuidos, conclusos = [], [], []
+    vistos = set()
  
-    # ── 1. Pautados (mov.417) ─────────────────────────────────────────────────
     log("=== Pautados (mov.417) ===")
     for codigo in sorted(TODOS_CODIGOS):
         orgao, ministro = CODIGO_PARA_ORGAO.get(codigo, ("Outro", str(codigo)))
-        dados = query_por_movimento(codigo, MOV_PAUTADO)
+        dados = query(codigo, MOV_PAUTADO)
         if not dados: continue
-        hits  = dados.get("hits", {}).get("hits", [])
-        total = dados.get("hits", {}).get("total", {}).get("value", 0)
+        hits = dados.get("hits",{}).get("hits",[])
+        total = dados.get("hits",{}).get("total",{}).get("value",0)
         log(f"  {orgao} — {ministro}: {total} com mov.417")
         for hit in hits:
-            src    = hit.get("_source", {})
-            numero = src.get("numeroProcesso", "")
+            src = hit.get("_source",{})
+            numero = src.get("numeroProcesso","")
             if numero in vistos: continue
-            assuntos = extrair_assuntos(src.get("assuntos", []))
-            area     = classificar_area(assuntos)
+            assuntos = extrair_assuntos(src.get("assuntos",[]))
+            area = classificar_area(assuntos)
             if area in AREAS_EXCLUIR: continue
-            situacao, data_p = analisar_pauta(src.get("movimentos", []))
+            situacao, data_p = analisar_pauta(src.get("movimentos",[]))
             if situacao != "pautado": continue
             vistos.add(numero)
             pautados.append({
-                "numero":     numero,
-                "orgao":      orgao,
-                "ministro":   ministro,
-                "area":       area,
-                "assuntos":   assuntos,
-                "data_ref":   fmt_data(data_p),
-                "data_sort":  data_p,
-                "urgencia":   calcular_urgencia(data_p),
-                "link":       stj_link(numero),
-                "tipo":       "pautado",
+                "numero": numero, "orgao": orgao, "ministro": ministro,
+                "area": area, "assuntos": assuntos,
+                "data_ref": fmt_data(data_p), "data_sort": data_p,
+                "urgencia": calcular_urgencia(data_p),
+                "link": stj_link(numero), "tipo": "pautado",
             })
         time.sleep(0.3)
  
-    # ── 2. Distribuídos recentes (mov.26, últimos 45d) ────────────────────────
-    log("=== Distribuídos (mov.26, últimos 45d) ===")
+    log("=== Distribuídos (mov.26, 45d) ===")
     since45 = (date.today() - timedelta(days=45)).isoformat()
     for codigo in sorted(TODOS_CODIGOS):
         orgao, ministro = CODIGO_PARA_ORGAO.get(codigo, ("Outro", str(codigo)))
-        dados = query_por_movimento(codigo, MOV_DISTRIBUIDO, since45)
+        dados = query(codigo, MOV_DISTRIBUIDO, since45)
         if not dados: continue
-        hits  = dados.get("hits", {}).get("hits", [])
-        total = dados.get("hits", {}).get("total", {}).get("value", 0)
-        log(f"  {orgao} — {ministro}: {total} distribuídos nos últimos 45d")
+        hits = dados.get("hits",{}).get("hits",[])
+        total = dados.get("hits",{}).get("total",{}).get("value",0)
+        log(f"  {orgao} — {ministro}: {total} nos últimos 45d")
         for hit in hits:
-            src    = hit.get("_source", {})
-            numero = src.get("numeroProcesso", "")
+            src = hit.get("_source",{})
+            numero = src.get("numeroProcesso","")
             if numero in vistos: continue
-            assuntos = extrair_assuntos(src.get("assuntos", []))
-            area     = classificar_area(assuntos)
+            assuntos = extrair_assuntos(src.get("assuntos",[]))
+            area = classificar_area(assuntos)
             if area in AREAS_EXCLUIR: continue
-            data_aj = src.get("dataAjuizamento", "")[:10]
+            data_aj = src.get("dataAjuizamento","")[:10]
             vistos.add(numero)
             distribuidos.append({
-                "numero":    numero,
-                "orgao":     orgao,
-                "ministro":  ministro,
-                "area":      area,
-                "assuntos":  assuntos,
-                "data_ref":  fmt_data(data_aj),
-                "data_sort": data_aj,
-                "urgencia":  "—",
-                "link":      stj_link(numero),
-                "tipo":      "distribuido",
+                "numero": numero, "orgao": orgao, "ministro": ministro,
+                "area": area, "assuntos": assuntos,
+                "data_ref": fmt_data(data_aj), "data_sort": data_aj,
+                "urgencia": "—", "link": stj_link(numero), "tipo": "distribuido",
             })
         time.sleep(0.3)
  
-    # ── 3. Conclusos (mov.51) — aguardando julgamento ─────────────────────────
     log("=== Conclusos (mov.51) ===")
     for codigo in sorted(TODOS_CODIGOS):
         orgao, ministro = CODIGO_PARA_ORGAO.get(codigo, ("Outro", str(codigo)))
-        dados = query_por_movimento(codigo, MOV_CONCLUSO)
+        dados = query(codigo, MOV_CONCLUSO)
         if not dados: continue
-        hits  = dados.get("hits", {}).get("hits", [])
-        total = dados.get("hits", {}).get("total", {}).get("value", 0)
+        hits = dados.get("hits",{}).get("hits",[])
+        total = dados.get("hits",{}).get("total",{}).get("value",0)
         log(f"  {orgao} — {ministro}: {total} com mov.51")
         for hit in hits:
-            src    = hit.get("_source", {})
-            numero = src.get("numeroProcesso", "")
+            src = hit.get("_source",{})
+            numero = src.get("numeroProcesso","")
             if numero in vistos: continue
-            assuntos = extrair_assuntos(src.get("assuntos", []))
-            area     = classificar_area(assuntos)
+            assuntos = extrair_assuntos(src.get("assuntos",[]))
+            area = classificar_area(assuntos)
             if area in AREAS_EXCLUIR: continue
-            data_c = data_mais_recente_mov(src.get("movimentos", []), MOV_CONCLUSO)
-            data_aj = src.get("dataAjuizamento", "")[:10]
+            data_c = data_mais_recente_mov(src.get("movimentos",[]), MOV_CONCLUSO)
+            data_aj = src.get("dataAjuizamento","")[:10]
             vistos.add(numero)
             conclusos.append({
-                "numero":    numero,
-                "orgao":     orgao,
-                "ministro":  ministro,
-                "area":      area,
-                "assuntos":  assuntos,
-                "data_ref":  fmt_data(data_c or data_aj),
-                "data_sort": data_c or data_aj,
-                "urgencia":  "—",
-                "link":      stj_link(numero),
-                "tipo":      "concluso",
+                "numero": numero, "orgao": orgao, "ministro": ministro,
+                "area": area, "assuntos": assuntos,
+                "data_ref": fmt_data(data_c or data_aj), "data_sort": data_c or data_aj,
+                "urgencia": "—", "link": stj_link(numero), "tipo": "concluso",
             })
         time.sleep(0.3)
  
-    pautados.sort(key=lambda x: (
-        {"Alta":0,"Média":1,"Baixa":2}.get(x["urgencia"],3), x["data_sort"]))
+    pautados.sort(key=lambda x: ({"Alta":0,"Média":1,"Baixa":2}.get(x["urgencia"],3), x["data_sort"]))
     distribuidos.sort(key=lambda x: x["data_sort"], reverse=True)
     conclusos.sort(key=lambda x: x["data_sort"], reverse=True)
     return pautados, distribuidos, conclusos
  
-# ── Geração de arquivos ───────────────────────────────────────────────────────
-HTML = '''<!DOCTYPE html>
+# ─────────────────────────────────────────────────────────────────────────────
+# HTML — sem nenhum dado embutido. Carrega data.js via <script src>.
+# data.js define window.STJ_DADOS antes do script principal rodar.
+# ─────────────────────────────────────────────────────────────────────────────
+HTML = r"""<!DOCTYPE html>
 <html lang="pt-BR">
 <head>
 <meta charset="UTF-8">
@@ -341,77 +304,71 @@ HTML = '''<!DOCTYPE html>
 <title>Monitor STJ - Marquez Advogados</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
-:root{
-  --bg:#0f1117;--sur:#1a1d2e;--sur2:#22263a;--bdr:#2e3250;
-  --acc:#6c7bff;--text:#e2e8f0;--mut:#8892b0;
-  --alt:#f87171;--med:#fbbf24;--ok:#4ade80;--inf:#60a5fa;--warn:#fb923c
-}
+:root{--bg:#0f1117;--sur:#1a1d2e;--sur2:#22263a;--bdr:#2e3250;--acc:#6c7bff;
+  --text:#e2e8f0;--mut:#8892b0;--alt:#f87171;--med:#fbbf24;--ok:#4ade80;
+  --inf:#60a5fa;--warn:#fb923c}
 body{background:var(--bg);color:var(--text);font-family:system-ui,sans-serif;font-size:14px}
-header{background:var(--sur);border-bottom:1px solid var(--bdr);padding:18px 28px;
+header{background:var(--sur);border-bottom:1px solid var(--bdr);padding:16px 28px;
   display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}
 .lw{display:flex;align-items:center;gap:12px}
-.lb{width:36px;height:36px;background:var(--acc);border-radius:9px;display:grid;place-items:center;font-size:18px}
-.lw h1{font-size:16px;font-weight:700}
-.lw p{font-size:11px;color:var(--mut)}
-.upd{background:var(--sur2);border:1px solid var(--bdr);border-radius:8px;
-  padding:5px 12px;font-size:11px;color:var(--mut);display:flex;align-items:center;gap:6px}
+.lb{width:34px;height:34px;background:var(--acc);border-radius:8px;display:grid;place-items:center;font-size:17px}
+.lw h1{font-size:15px;font-weight:700}.lw p{font-size:11px;color:var(--mut)}
+.upd{background:var(--sur2);border:1px solid var(--bdr);border-radius:7px;
+  padding:5px 11px;font-size:11px;color:var(--mut);display:flex;align-items:center;gap:6px}
 .dot{width:7px;height:7px;border-radius:50%;background:var(--ok);animation:pulse 2s infinite}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
-.cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:10px;padding:20px 28px}
-.card{background:var(--sur);border:1px solid var(--bdr);border-radius:10px;padding:13px;position:relative;overflow:hidden}
-.cl{font-size:10px;color:var(--mut);text-transform:uppercase;letter-spacing:.6px;margin-bottom:5px}
-.cv{font-size:24px;font-weight:800;line-height:1}
-.cb2{position:absolute;bottom:0;left:0;right:0;height:3px}
-.ct .cv{color:var(--acc)} .ct .cb2{background:var(--acc)}
-.ca .cv{color:var(--alt)}  .ca .cb2{background:var(--alt)}
-.cm .cv{color:var(--med)}  .cm .cb2{background:var(--med)}
-.cg .cv{color:var(--ok)}   .cg .cb2{background:var(--ok)}
-.ci .cv{color:var(--inf)}  .ci .cb2{background:var(--inf)}
-.cw .cv{color:var(--warn)} .cw .cb2{background:var(--warn)}
+.cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(136px,1fr));gap:9px;padding:18px 28px}
+.card{background:var(--sur);border:1px solid var(--bdr);border-radius:9px;padding:12px;position:relative;overflow:hidden}
+.cl{font-size:9px;color:var(--mut);text-transform:uppercase;letter-spacing:.6px;margin-bottom:5px}
+.cv{font-size:22px;font-weight:800;line-height:1}
+.cb{position:absolute;bottom:0;left:0;right:0;height:3px}
+.ct .cv{color:var(--acc)}.ct .cb{background:var(--acc)}
+.ca .cv{color:var(--alt)}.ca .cb{background:var(--alt)}
+.cm .cv{color:var(--med)}.cm .cb{background:var(--med)}
+.cg .cv{color:var(--ok)}.cg .cb{background:var(--ok)}
+.ci .cv{color:var(--inf)}.ci .cb{background:var(--inf)}
+.cw .cv{color:var(--warn)}.cw .cb{background:var(--warn)}
 .tabs{display:flex;gap:3px;padding:0 28px;border-bottom:1px solid var(--bdr)}
-.tab{padding:8px 14px;border-radius:8px 8px 0 0;cursor:pointer;font-size:13px;
-  font-weight:500;color:var(--mut);border:1px solid transparent;border-bottom:none;background:transparent}
-.tab.on{background:var(--sur);border-color:var(--bdr);border-bottom:1px solid var(--sur);
-  color:var(--text);margin-bottom:-1px}
+.tab{padding:8px 14px;border-radius:8px 8px 0 0;cursor:pointer;font-size:13px;font-weight:500;
+  color:var(--mut);border:1px solid transparent;border-bottom:none;background:transparent}
+.tab.on{background:var(--sur);border-color:var(--bdr);border-bottom:1px solid var(--sur);color:var(--text);margin-bottom:-1px}
 .tab:hover:not(.on){background:var(--sur2);color:var(--text)}
 .bar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:12px 28px;
   background:var(--sur);border-bottom:1px solid var(--bdr)}
-.sw{position:relative;flex:1;min-width:160px;max-width:300px}
+.sw{position:relative;flex:1;min-width:160px;max-width:290px}
 .sw input{width:100%;background:var(--sur2);border:1px solid var(--bdr);border-radius:7px;
-  padding:7px 10px 7px 28px;color:var(--text);font-size:13px;outline:none}
+  padding:6px 10px 6px 28px;color:var(--text);font-size:13px;outline:none}
 .sw input:focus{border-color:var(--acc)}
-.sw::before{content:"?";position:absolute;left:9px;top:50%;transform:translateY(-50%);font-size:11px;color:var(--mut)}
+.sw::before{content:"";position:absolute;left:9px;top:50%;transform:translateY(-50%);
+  width:11px;height:11px;border:1.5px solid var(--mut);border-radius:50%}
 select{background:var(--sur2);border:1px solid var(--bdr);border-radius:7px;
-  color:var(--text);padding:7px 10px;font-size:13px;cursor:pointer;outline:none}
+  color:var(--text);padding:6px 10px;font-size:13px;cursor:pointer;outline:none}
 .cnt{margin-left:auto;background:var(--sur2);border:1px solid var(--bdr);
-  border-radius:6px;padding:4px 10px;font-size:11px;color:var(--mut);white-space:nowrap}
-.notice{background:var(--sur2);border-left:3px solid var(--warn);margin:12px 28px;
-  padding:8px 14px;border-radius:0 7px 7px 0;font-size:12px;color:var(--mut)}
+  border-radius:6px;padding:3px 10px;font-size:11px;color:var(--mut);white-space:nowrap}
 .twrap{overflow-x:auto;padding:0 28px 40px}
 table{width:100%;border-collapse:collapse;margin-top:12px}
 th{text-align:left;padding:8px 10px;font-size:10px;font-weight:600;color:var(--mut);
   text-transform:uppercase;letter-spacing:.5px;border-bottom:1px solid var(--bdr);
   white-space:nowrap;cursor:pointer;user-select:none}
 th:hover{color:var(--text)}
-th.sa::after{content:" a";color:var(--acc)} th.sd::after{content:" v";color:var(--acc)}
-tr{border-bottom:1px solid var(--bdr)}
-tbody tr:hover{background:var(--sur2)}
-td{padding:10px 10px;vertical-align:top;font-size:13px}
+th.sa::after{content:" \25b2";color:var(--acc)}th.sd::after{content:" \25bc";color:var(--acc)}
+tr{border-bottom:1px solid var(--bdr)}tbody tr:hover{background:var(--sur2)}
+td{padding:10px;vertical-align:top;font-size:13px}
 .nl{color:var(--acc);text-decoration:none;font-weight:600;white-space:nowrap}
 .nl:hover{color:#a78bfa;text-decoration:underline}
 .bp{display:inline-block;padding:2px 8px;border-radius:20px;font-size:11px;font-weight:600;white-space:nowrap}
 .uA{background:rgba(248,113,113,.15);color:#f87171;border:1px solid rgba(248,113,113,.3)}
 .uM{background:rgba(251,191,36,.15);color:#fbbf24;border:1px solid rgba(251,191,36,.3)}
 .uB{background:rgba(74,222,128,.15);color:#4ade80;border:1px solid rgba(74,222,128,.3)}
-.uD{background:rgba(96,165,250,.1);color:#60a5fa;border:1px solid rgba(96,165,250,.2)}
+.uD{background:rgba(148,163,184,.1);color:#94a3b8;border:1px solid rgba(148,163,184,.2)}
 .op{display:inline-block;padding:2px 7px;border-radius:5px;font-size:11px;
   background:var(--sur2);border:1px solid var(--bdr);color:var(--mut)}
-.mt{font-size:12px;color:var(--mut);max-width:240px}
-.empty{text-align:center;padding:50px 20px;color:var(--mut)}
+.mt{font-size:12px;color:var(--mut);max-width:230px}
+.empty{text-align:center;padding:50px;color:var(--mut);font-size:13px}
+.err{margin:20px 28px;padding:12px 16px;background:rgba(248,113,113,.1);
+  border:1px solid rgba(248,113,113,.3);border-radius:8px;color:#f87171;font-size:13px}
 ::-webkit-scrollbar{width:5px;height:5px}
-::-webkit-scrollbar-track{background:var(--bg)}
-::-webkit-scrollbar-thumb{background:var(--bdr);border-radius:3px}
-@media(max-width:680px){header,.cards,.tabs,.bar,.twrap{padding-left:12px;padding-right:12px}}
+::-webkit-scrollbar-track{background:var(--bg)}::-webkit-scrollbar-thumb{background:var(--bdr);border-radius:3px}
 </style>
 </head>
 <body>
@@ -420,10 +377,10 @@ td{padding:10px 10px;vertical-align:top;font-size:13px}
     <div class="lb">&#9878;</div>
     <div><h1>Monitor STJ</h1><p>Marquez Advogados &middot; Prospec&ccedil;&atilde;o Ativa</p></div>
   </div>
-  <div class="upd"><span class="dot"></span>Atualizado em <strong id="upd-txt" style="margin-left:4px"></strong></div>
+  <div class="upd"><span class="dot"></span>Atualizado em&nbsp;<strong id="upd"></strong></div>
 </header>
 <div class="cards" id="cards"></div>
-<div class="tabs" id="tabs"></div>
+<div class="tabs"  id="tabs"></div>
 <div class="bar">
   <div class="sw"><input id="q" type="text" placeholder="N&uacute;mero, ministro, assunto..." oninput="render()"></div>
   <select id="fo" onchange="render()">
@@ -432,212 +389,198 @@ td{padding:10px 10px;vertical-align:top;font-size:13px}
   </select>
   <select id="fa" onchange="render()"><option value="">Todas as &aacute;reas</option></select>
   <select id="fu" onchange="render()">
-    <option value="">Todas urg&ecirc;ncias</option>
-    <option value="Alta">Alta</option><option value="Media">M&eacute;dia</option><option value="Baixa">Baixa</option>
+    <option value="">Todas as urg&ecirc;ncias</option>
+    <option value="Alta">Alta</option>
+    <option value="Media">M&eacute;dia</option>
+    <option value="Baixa">Baixa</option>
   </select>
   <span class="cnt" id="cnt">carregando...</span>
 </div>
-<div id="notice" class="notice" style="display:none"></div>
-<div class="twrap"><table><thead id="th"></thead><tbody id="tb"></tbody></table>
-<div class="empty" id="emp" style="display:none">Nenhum processo com esses filtros.</div></div>
+<div class="twrap">
+  <table><thead id="th"></thead><tbody id="tb"></tbody></table>
+  <div class="empty" id="emp" style="display:none">Nenhum processo com esses filtros.</div>
+</div>
  
+<!-- data.js define window.STJ_META e window.STJ_DADOS antes do script principal -->
+<script src="data.js"></script>
 <script>
-var META = {atualizado:"__ATUALIZADO__"};
-var tabAtual = "pautado", sCol = "data_sort", sDir = -1;
-var DADOS = [];
+(function() {
+  // Verifica se data.js carregou
+  if (!window.STJ_DADOS) {
+    document.getElementById("cnt").textContent = "Erro: data.js nao carregou.";
+    return;
+  }
  
-var TABS = [
-  {id:"pautado",    label:"Pautados"},
-  {id:"distribuido",label:"Distribu&iacute;dos"},
-  {id:"concluso",   label:"Conclusos"},
-  {id:"todos",      label:"Todos"}
-];
-var COLS_P = ["numero","orgao","ministro","area","assuntos","data_ref","urgencia"];
-var COLS_D = ["numero","orgao","ministro","area","assuntos","data_ref"];
-var LABELS = {numero:"N\u00famero",orgao:"\u00d3rg\u00e3o",ministro:"Ministro/a",
-  area:"\u00c1rea",assuntos:"Assuntos",data_ref:"Data Ref.",urgencia:"Urg\u00eancia"};
+  var DADOS   = window.STJ_DADOS;
+  var META    = window.STJ_META;
+  var tabAtual = "pautado";
+  var sCol = "data_sort", sDir = -1;
  
-document.getElementById("upd-txt").textContent = META.atualizado;
+  document.getElementById("upd").textContent = META.atualizado;
  
-function buildTabs() {
-  var el = document.getElementById("tabs");
-  TABS.forEach(function(t) {
+  var TABS_DEF = [
+    {id:"pautado",    lbl:"Pautados"},
+    {id:"distribuido",lbl:"Distribu\u00eddos"},
+    {id:"concluso",   lbl:"Conclusos"},
+    {id:"todos",      lbl:"Todos"},
+  ];
+  var COLS_P = ["numero","orgao","ministro","area","assuntos","data_ref","urgencia"];
+  var COLS_D = ["numero","orgao","ministro","area","assuntos","data_ref"];
+  var LBL = {
+    numero:"N\u00famero", orgao:"\u00d3rg\u00e3o", ministro:"Ministro/a",
+    area:"\u00c1rea", assuntos:"Assuntos", data_ref:"Data", urgencia:"Urg\u00eancia"
+  };
+ 
+  function count(tipo) {
+    if (tipo === "todos") return DADOS.length;
+    return DADOS.filter(function(p){return p.tipo===tipo;}).length;
+  }
+ 
+  // Tabs
+  var tabsEl = document.getElementById("tabs");
+  TABS_DEF.forEach(function(t) {
     var d = document.createElement("div");
-    d.className = "tab" + (t.id === tabAtual ? " on" : "");
-    d.innerHTML = t.label + ' (<span class="tc-' + t.id + '">...</span>)';
+    d.className = "tab" + (t.id===tabAtual?" on":"");
+    d.id = "tab-" + t.id;
+    d.textContent = t.lbl + " (" + count(t.id) + ")";
     d.onclick = function() {
       tabAtual = t.id; sCol = "data_sort"; sDir = -1;
       document.querySelectorAll(".tab").forEach(function(x){x.classList.remove("on");});
       d.classList.add("on");
       render();
     };
-    el.appendChild(d);
+    tabsEl.appendChild(d);
   });
-}
  
-function updateTabCounts() {
-  ["pautado","distribuido","concluso","todos"].forEach(function(t) {
-    var n = t === "todos" ? DADOS.length : DADOS.filter(function(p){return p.tipo===t;}).length;
-    var els = document.querySelectorAll(".tc-" + t);
-    els.forEach(function(e){e.textContent = n;});
-  });
-}
- 
-function buildCards() {
-  var p = DADOS.filter(function(x){return x.tipo==="pautado";});
-  var d = DADOS.filter(function(x){return x.tipo==="distribuido";});
-  var c = DADOS.filter(function(x){return x.tipo==="concluso";});
-  var by = function(t,v){return DADOS.filter(function(x){return x[t]===v;}).length;};
-  var cards = [
-    {cls:"ct",lbl:"Total",val:DADOS.length},
-    {cls:"ca",lbl:"Alta Urg\u00eancia",val:p.filter(function(x){return x.urgencia==="Alta";}).length},
-    {cls:"cm",lbl:"M\u00e9dia Urg\u00eancia",val:p.filter(function(x){return x.urgencia==="M\u00e9dia";}).length},
-    {cls:"cg",lbl:"Baixa Urg\u00eancia",val:p.filter(function(x){return x.urgencia==="Baixa";}).length},
-    {cls:"ci",lbl:"Distribu\u00eddos 45d",val:d.length},
-    {cls:"cw",lbl:"Conclusos",val:c.length},
-    {cls:"ct",lbl:"3\u00aa Turma",val:by("orgao","3\u00aa Turma")},
-    {cls:"ct",lbl:"4\u00aa Turma",val:by("orgao","4\u00aa Turma")},
-    {cls:"ct",lbl:"Corte Especial",val:by("orgao","Corte Especial")},
+  // Cards
+  var p  = DADOS.filter(function(x){return x.tipo==="pautado";});
+  var di = DADOS.filter(function(x){return x.tipo==="distribuido";});
+  var co = DADOS.filter(function(x){return x.tipo==="concluso";});
+  var by = function(k,v){return DADOS.filter(function(x){return x[k]===v;}).length;};
+  var cardsData = [
+    {c:"ct", l:"Total",            v:DADOS.length},
+    {c:"ca", l:"Alta Urg\u00eancia", v:p.filter(function(x){return x.urgencia==="Alta";}).length},
+    {c:"cm", l:"M\u00e9dia Urg\u00eancia",v:p.filter(function(x){return x.urgencia==="M\u00e9dia";}).length},
+    {c:"cg", l:"Baixa Urg\u00eancia",v:p.filter(function(x){return x.urgencia==="Baixa";}).length},
+    {c:"ci", l:"Distribu\u00eddos",  v:di.length},
+    {c:"cw", l:"Conclusos",          v:co.length},
+    {c:"ct", l:"3\u00aa Turma",      v:by("orgao","3\u00aa Turma")},
+    {c:"ct", l:"4\u00aa Turma",      v:by("orgao","4\u00aa Turma")},
+    {c:"ct", l:"Corte Especial",     v:by("orgao","Corte Especial")},
   ];
-  document.getElementById("cards").innerHTML = cards.map(function(c){
-    return '<div class="card '+c.cls+'"><div class="cl">'+c.lbl+'</div>'+
-           '<div class="cv">'+c.val+'</div><div class="cb2"></div></div>';
+  document.getElementById("cards").innerHTML = cardsData.map(function(c){
+    return '<div class="card '+c.c+'"><div class="cl">'+c.l+'</div>'+
+           '<div class="cv">'+c.v+'</div><div class="cb"></div></div>';
   }).join("");
-}
  
-function buildAreaFilter() {
+  // Filtro de áreas
   var seen = {}, areas = [];
   DADOS.forEach(function(p){if(!seen[p.area]){seen[p.area]=true;areas.push(p.area);}});
   areas.sort();
   var sel = document.getElementById("fa");
-  areas.forEach(function(a){
-    var o = document.createElement("option"); o.value=a; o.text=a; sel.appendChild(o);
-  });
-}
+  areas.forEach(function(a){var o=document.createElement("option");o.value=a;o.text=a;sel.appendChild(o);});
  
-function filtrado() {
-  var q  = document.getElementById("q").value.toLowerCase();
-  var fo = document.getElementById("fo").value;
-  var fa = document.getElementById("fa").value;
-  var fu = document.getElementById("fu").value;
-  return DADOS.filter(function(p) {
-    if (tabAtual !== "todos" && p.tipo !== tabAtual) return false;
-    if (fo && p.orgao !== fo) return false;
-    if (fa && p.area  !== fa) return false;
-    if (fu) {
-      var u = p.urgencia === "M\u00e9dia" ? "Media" : p.urgencia;
-      if (u !== fu) return false;
-    }
-    if (q) {
-      var hay = [p.numero,p.ministro,p.assuntos,p.area,p.orgao].join(" ").toLowerCase();
-      if (hay.indexOf(q) < 0) return false;
-    }
-    return true;
-  });
-}
- 
-function ordenado(arr) {
-  return arr.slice().sort(function(a,b){
-    var va=a[sCol]||"", vb=b[sCol]||"";
-    return sDir*(va>vb?1:va<vb?-1:0);
-  });
-}
- 
-function badge(u) {
-  if (u==="Alta")  return '<span class="bp uA">Alta</span>';
-  if (u==="M\u00e9dia") return '<span class="bp uM">M\u00e9dia</span>';
-  if (u==="Baixa") return '<span class="bp uB">Baixa</span>';
-  return '<span class="bp uD">-</span>';
-}
- 
-function render() {
-  var rows = ordenado(filtrado());
-  var cols = (tabAtual==="pautado" || tabAtual==="todos") ? COLS_P : COLS_D;
-  var thead = "<tr>";
-  cols.forEach(function(k){
-    var cl = sCol===k ? (sDir===-1?"sd":"sa") : "";
-    thead += '<th class="'+cl+'" onclick="ss(\''+k+'\')">'+LABELS[k]+"</th>";
-  });
-  thead += "</tr>";
-  document.getElementById("th").innerHTML = thead;
-  var emp = document.getElementById("emp");
-  if (!rows.length) {
-    document.querySelector("table").style.display="none";
-    emp.style.display="block";
-    document.getElementById("cnt").textContent="0 processos";
-    return;
+  function badge(u) {
+    if (u==="Alta")  return '<span class="bp uA">Alta</span>';
+    if (u==="M\u00e9dia") return '<span class="bp uM">M\u00e9dia</span>';
+    if (u==="Baixa") return '<span class="bp uB">Baixa</span>';
+    return '<span class="bp uD">-</span>';
   }
-  document.querySelector("table").style.display="table";
-  emp.style.display="none";
-  document.getElementById("cnt").textContent=rows.length+" processo"+(rows.length!==1?"s":"");
-  var useCols = (tabAtual==="pautado") ? COLS_P : (tabAtual==="todos" ? COLS_P : COLS_D);
-  var html = "";
-  rows.forEach(function(p){
-    var c2 = (p.tipo==="distribuido"||p.tipo==="concluso") && tabAtual!=="pautado" && tabAtual!=="todos" ? COLS_D : COLS_P;
-    html += "<tr>";
-    c2.forEach(function(k){
-      if (k==="numero")   html += '<td><a class="nl" href="'+p.link+'" target="_blank">'+p.numero+'</a></td>';
-      else if (k==="orgao")    html += '<td><span class="op">'+p.orgao+'</span></td>';
-      else if (k==="urgencia") html += '<td>'+badge(p.urgencia)+'</td>';
-      else if (k==="assuntos") {
-        var t=p.assuntos||""; var s=t.length>65?t.slice(0,65)+"...":t;
-        html += '<td class="mt" title="'+t+'">'+(s||"-")+'</td>';
+ 
+  function filtrado() {
+    var q  = document.getElementById("q").value.toLowerCase();
+    var fo = document.getElementById("fo").value;
+    var fa = document.getElementById("fa").value;
+    var fu = document.getElementById("fu").value;
+    return DADOS.filter(function(p) {
+      if (tabAtual!=="todos" && p.tipo!==tabAtual) return false;
+      if (fo && p.orgao!==fo) return false;
+      if (fa && p.area!==fa)  return false;
+      if (fu) {
+        var u = p.urgencia==="M\u00e9dia"?"Media":p.urgencia;
+        if (u!==fu) return false;
       }
-      else html += '<td>'+(p[k]||"-")+'</td>';
+      if (q) {
+        if ([p.numero,p.ministro,p.assuntos,p.area,p.orgao].join(" ").toLowerCase().indexOf(q)<0) return false;
+      }
+      return true;
     });
-    html += "</tr>";
-  });
-  document.getElementById("tb").innerHTML = html;
-}
+  }
  
-function ss(col){sCol===col?sDir*=-1:(sCol=col,sDir=-1);render();}
+  function render() {
+    var rows = filtrado().sort(function(a,b){
+      var va=a[sCol]||"", vb=b[sCol]||"";
+      return sDir*(va>vb?1:va<vb?-1:0);
+    });
+    var cols = (tabAtual==="distribuido"||tabAtual==="concluso") ? COLS_D : COLS_P;
+    var th = "<tr>";
+    cols.forEach(function(k){
+      var cl=sCol===k?(sDir===-1?"sd":"sa"):"";
+      th+='<th class="'+cl+'" onclick="ss(\''+k+'\')">'+LBL[k]+"</th>";
+    });
+    document.getElementById("th").innerHTML = th+"</tr>";
+    var emp=document.getElementById("emp");
+    if (!rows.length) {
+      document.querySelector("table").style.display="none";
+      emp.style.display="block";
+      document.getElementById("cnt").textContent="0 processos";
+      return;
+    }
+    document.querySelector("table").style.display="table";
+    emp.style.display="none";
+    document.getElementById("cnt").textContent=rows.length+" processo"+(rows.length!==1?"s":"");
+    var useCols=(tabAtual==="distribuido"||tabAtual==="concluso")?COLS_D:COLS_P;
+    var html="";
+    rows.forEach(function(p){
+      var c2=(p.tipo==="distribuido"||p.tipo==="concluso")&&tabAtual!=="pautado"&&tabAtual!=="todos"?COLS_D:COLS_P;
+      html+="<tr>";
+      c2.forEach(function(k){
+        if(k==="numero") html+='<td><a class="nl" href="'+p.link+'" target="_blank">'+p.numero+'</a></td>';
+        else if(k==="orgao") html+='<td><span class="op">'+p.orgao+'</span></td>';
+        else if(k==="urgencia") html+='<td>'+badge(p.urgencia)+'</td>';
+        else if(k==="assuntos"){var t=p.assuntos||"";html+='<td class="mt" title="'+t.replace(/"/g,"&quot;")+'">'+
+          (t.length>60?t.slice(0,60)+"...":t||"-")+'</td>';}
+        else html+='<td>'+(p[k]||"-")+'</td>';
+      });
+      html+="</tr>";
+    });
+    document.getElementById("tb").innerHTML=html;
+  }
  
-// Carrega dados do arquivo JSON separado — sem injeção no HTML
-fetch("data.json")
-  .then(function(r){
-    if(!r.ok) throw new Error("HTTP "+r.status);
-    return r.json();
-  })
-  .then(function(data){
-    DADOS = data;
-    buildTabs();
-    buildCards();
-    buildAreaFilter();
-    updateTabCounts();
-    render();
-  })
-  .catch(function(err){
-    document.getElementById("cnt").textContent = "Erro ao carregar dados: "+err.message;
-    console.error(err);
-  });
+  window.ss = function(col){sCol===col?sDir*=-1:(sCol=col,sDir=-1);render();};
+  window.render = render;
+  render();
+})();
 </script>
 </body>
-</html>'''
+</html>"""
  
  
 def main():
     pautados, distribuidos, conclusos = coletar()
     todos = pautados + distribuidos + conclusos
  
-    log(f"Pautados: {len(pautados)} | Alta: {sum(1 for p in pautados if p['urgencia']=='Alta')} | "
-        f"Media: {sum(1 for p in pautados if p['urgencia']=='Media')} | "
-        f"Baixa: {sum(1 for p in pautados if p['urgencia']=='Baixa')}")
-    log(f"Distribuidos: {len(distribuidos)} | Conclusos: {len(conclusos)} | Total: {len(todos)}")
+    log(f"Pautados: {len(pautados)} | Distribuídos: {len(distribuidos)} | Conclusos: {len(conclusos)} | Total: {len(todos)}")
  
     out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "stj")
     os.makedirs(out_dir, exist_ok=True)
  
-    # Grava data.json separado — 100% seguro, sem injeção no HTML
-    with open(os.path.join(out_dir, "data.json"), "w", encoding="utf-8") as f:
-        json.dump(todos, f, ensure_ascii=False)
-    log("data.json gravado")
- 
     # BRT = UTC-3
     atualizado = (datetime.utcnow() - timedelta(hours=3)).strftime("%d/%m/%Y %H:%M") + " (BRT)"
-    html = HTML.replace("__ATUALIZADO__", atualizado)
+ 
+    # data.js — arquivo JavaScript externo com os dados
+    # Carregado via <script src="data.js"> antes do script principal
+    # Não há risco de conflito com HTML parser
+    dados_js = (
+        "window.STJ_META=" + json.dumps({"atualizado": atualizado}, ensure_ascii=False) + ";\n"
+        "window.STJ_DADOS=" + json.dumps(todos, ensure_ascii=False) + ";\n"
+    )
+    with open(os.path.join(out_dir, "data.js"), "w", encoding="utf-8") as f:
+        f.write(dados_js)
+    log(f"data.js gravado ({len(todos)} processos, {len(dados_js)//1024}KB)")
  
     with open(os.path.join(out_dir, "index.html"), "w", encoding="utf-8") as f:
-        f.write(html)
+        f.write(HTML)
     log("index.html gravado")
  
  
