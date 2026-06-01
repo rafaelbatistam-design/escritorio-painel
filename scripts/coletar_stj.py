@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
 Monitor STJ — Marquez Advogados
-Consulta Datajud por código de gabinete, gera stj/index.html.
+Gera stj/data.json e stj/index.html para GitHub Pages.
+JSON separado do HTML elimina qualquer risco de quebra de JavaScript.
 """
  
 import json, os, sys, time, urllib.request, urllib.error, urllib.parse
 from datetime import datetime, date, timedelta
-from collections import Counter
  
 # ── Configuração ──────────────────────────────────────────────────────────────
 API_KEY = os.environ.get("DATAJUD_API_KEY", "")
@@ -54,6 +54,7 @@ TODOS_CODIGOS = set(TERCEIRA_TURMA) | set(QUARTA_TURMA) | set(CORTE_ESPECIAL)
  
 MOV_PAUTADO     = 417
 MOV_DISTRIBUIDO = 26
+MOV_CONCLUSO    = 51
 CODIGOS_CANCEL  = {12106, 897, 193}
  
 AREAS_EXCLUIR = {"Tributário / Fiscal", "Trabalhista / Previdenciário"}
@@ -138,12 +139,6 @@ def extrair_assuntos(assuntos):
     return "; ".join(n for n in nomes if n)
  
 def analisar_pauta(movimentos):
-    """
-    Retorna (situacao, data_inclusao).
-    Mantém processo como 'pautado' se teve mov.417 e não houve
-    cancelamento (12106), retirada (897) ou julgamento (193) posterior.
-    Remove restrição de 60 dias na inclusão — o que importa é estar ativo.
-    """
     if not movimentos:
         return "sem_pauta", ""
     movs = sorted(movimentos, key=lambda m: m.get("dataHora", ""))
@@ -158,6 +153,11 @@ def analisar_pauta(movimentos):
         if m.get("codigo") in CODIGOS_CANCEL:
             return "cancelado", ultima_data
     return "pautado", ultima_data
+ 
+def data_mais_recente_mov(movimentos, codigo_mov):
+    datas = [m.get("dataHora", "")[:10]
+             for m in (movimentos or []) if m.get("codigo") == codigo_mov]
+    return max(datas) if datas else ""
  
 def calcular_urgencia(data_inclusao):
     if not data_inclusao:
@@ -205,34 +205,16 @@ def post_api(body):
         log(f"  Erro: {e}")
         return None
  
-def query_gabinete_pautados(codigo):
+def query_por_movimento(codigo_gabinete, codigo_mov, since_iso=None):
+    must = [
+        {"term": {"orgaoJulgador.codigo": codigo_gabinete}},
+        {"term": {"movimentos.codigo": codigo_mov}},
+    ]
+    if since_iso:
+        must.append({"range": {"dataAjuizamento": {"gte": since_iso}}})
     return post_api({
         "size": 200,
-        "query": {
-            "bool": {
-                "must": [
-                    {"term": {"orgaoJulgador.codigo": codigo}},
-                    {"term": {"movimentos.codigo": MOV_PAUTADO}},
-                ]
-            }
-        },
-        "_source": ["numeroProcesso", "classe", "orgaoJulgador",
-                    "assuntos", "movimentos", "dataAjuizamento"],
-    })
- 
-def query_gabinete_distribuidos(codigo, since_iso):
-    """Busca processos com distribuição recente usando dataAjuizamento como proxy."""
-    return post_api({
-        "size": 200,
-        "query": {
-            "bool": {
-                "must": [
-                    {"term": {"orgaoJulgador.codigo": codigo}},
-                    {"term": {"movimentos.codigo": MOV_DISTRIBUIDO}},
-                    {"range": {"dataAjuizamento": {"gte": since_iso}}},
-                ]
-            }
-        },
+        "query": {"bool": {"must": must}},
         "_source": ["numeroProcesso", "classe", "orgaoJulgador",
                     "assuntos", "movimentos", "dataAjuizamento"],
         "sort": [{"dataAjuizamento": {"order": "desc"}}],
@@ -242,76 +224,68 @@ def query_gabinete_distribuidos(codigo, since_iso):
 def coletar():
     pautados    = []
     distribuidos = []
-    vistos_p    = set()
-    vistos_d    = set()
+    conclusos   = []
+    vistos      = set()
  
-    # ── Pautados (mov.417, últimos 60 dias) ──────────────────────────────────
-    log("=== Coletando pautados (mov. 417) ===")
+    # ── 1. Pautados (mov.417) ─────────────────────────────────────────────────
+    log("=== Pautados (mov.417) ===")
     for codigo in sorted(TODOS_CODIGOS):
-        orgao_str, ministro = CODIGO_PARA_ORGAO.get(codigo, ("Outro", str(codigo)))
-        dados = query_gabinete_pautados(codigo)
-        if not dados:
-            continue
+        orgao, ministro = CODIGO_PARA_ORGAO.get(codigo, ("Outro", str(codigo)))
+        dados = query_por_movimento(codigo, MOV_PAUTADO)
+        if not dados: continue
         hits  = dados.get("hits", {}).get("hits", [])
         total = dados.get("hits", {}).get("total", {}).get("value", 0)
-        log(f"  {orgao_str} — {ministro} (cód.{codigo}): {total} com mov.417, analisando {len(hits)}")
+        log(f"  {orgao} — {ministro}: {total} com mov.417")
         for hit in hits:
             src    = hit.get("_source", {})
             numero = src.get("numeroProcesso", "")
-            if numero in vistos_p:
-                continue
-            vistos_p.add(numero)
-            assuntos   = extrair_assuntos(src.get("assuntos", []))
-            area       = classificar_area(assuntos)
-            if area in AREAS_EXCLUIR:
-                continue
-            situacao, data_pauta = analisar_pauta(src.get("movimentos", []))
-            if situacao != "pautado":
-                continue
-            urgencia = calcular_urgencia(data_pauta)
+            if numero in vistos: continue
+            assuntos = extrair_assuntos(src.get("assuntos", []))
+            area     = classificar_area(assuntos)
+            if area in AREAS_EXCLUIR: continue
+            situacao, data_p = analisar_pauta(src.get("movimentos", []))
+            if situacao != "pautado": continue
+            vistos.add(numero)
             pautados.append({
                 "numero":     numero,
-                "orgao":      orgao_str,
+                "orgao":      orgao,
                 "ministro":   ministro,
                 "area":       area,
                 "assuntos":   assuntos,
-                "data_pauta": fmt_data(data_pauta),
-                "data_sort":  data_pauta,
-                "urgencia":   urgencia,
+                "data_ref":   fmt_data(data_p),
+                "data_sort":  data_p,
+                "urgencia":   calcular_urgencia(data_p),
                 "link":       stj_link(numero),
                 "tipo":       "pautado",
             })
         time.sleep(0.3)
  
-    # ── Distribuídos (mov.26, dataAjuizamento últimos 45 dias) ───────────────
-    log("=== Coletando distribuídos (mov. 26, últimos 45 dias) ===")
-    since = (date.today() - timedelta(days=45)).isoformat()
+    # ── 2. Distribuídos recentes (mov.26, últimos 45d) ────────────────────────
+    log("=== Distribuídos (mov.26, últimos 45d) ===")
+    since45 = (date.today() - timedelta(days=45)).isoformat()
     for codigo in sorted(TODOS_CODIGOS):
-        orgao_str, ministro = CODIGO_PARA_ORGAO.get(codigo, ("Outro", str(codigo)))
-        dados = query_gabinete_distribuidos(codigo, since)
-        if not dados:
-            continue
+        orgao, ministro = CODIGO_PARA_ORGAO.get(codigo, ("Outro", str(codigo)))
+        dados = query_por_movimento(codigo, MOV_DISTRIBUIDO, since45)
+        if not dados: continue
         hits  = dados.get("hits", {}).get("hits", [])
         total = dados.get("hits", {}).get("total", {}).get("value", 0)
-        log(f"  {orgao_str} — {ministro} (cód.{codigo}): {total} nos últimos 45d, analisando {len(hits)}")
+        log(f"  {orgao} — {ministro}: {total} distribuídos nos últimos 45d")
         for hit in hits:
             src    = hit.get("_source", {})
             numero = src.get("numeroProcesso", "")
-            if numero in vistos_d or numero in vistos_p:
-                continue
-            vistos_d.add(numero)
+            if numero in vistos: continue
             assuntos = extrair_assuntos(src.get("assuntos", []))
             area     = classificar_area(assuntos)
-            if area in AREAS_EXCLUIR:
-                continue
+            if area in AREAS_EXCLUIR: continue
             data_aj = src.get("dataAjuizamento", "")[:10]
+            vistos.add(numero)
             distribuidos.append({
                 "numero":    numero,
-                "orgao":     orgao_str,
+                "orgao":     orgao,
                 "ministro":  ministro,
                 "area":      area,
                 "assuntos":  assuntos,
-                "data_dist": fmt_data(data_aj),
+                "data_ref":  fmt_data(data_aj),
                 "data_sort": data_aj,
                 "urgencia":  "—",
                 "link":      stj_link(numero),
@@ -319,172 +293,139 @@ def coletar():
             })
         time.sleep(0.3)
  
+    # ── 3. Conclusos (mov.51) — aguardando julgamento ─────────────────────────
+    log("=== Conclusos (mov.51) ===")
+    for codigo in sorted(TODOS_CODIGOS):
+        orgao, ministro = CODIGO_PARA_ORGAO.get(codigo, ("Outro", str(codigo)))
+        dados = query_por_movimento(codigo, MOV_CONCLUSO)
+        if not dados: continue
+        hits  = dados.get("hits", {}).get("hits", [])
+        total = dados.get("hits", {}).get("total", {}).get("value", 0)
+        log(f"  {orgao} — {ministro}: {total} com mov.51")
+        for hit in hits:
+            src    = hit.get("_source", {})
+            numero = src.get("numeroProcesso", "")
+            if numero in vistos: continue
+            assuntos = extrair_assuntos(src.get("assuntos", []))
+            area     = classificar_area(assuntos)
+            if area in AREAS_EXCLUIR: continue
+            data_c = data_mais_recente_mov(src.get("movimentos", []), MOV_CONCLUSO)
+            data_aj = src.get("dataAjuizamento", "")[:10]
+            vistos.add(numero)
+            conclusos.append({
+                "numero":    numero,
+                "orgao":     orgao,
+                "ministro":  ministro,
+                "area":      area,
+                "assuntos":  assuntos,
+                "data_ref":  fmt_data(data_c or data_aj),
+                "data_sort": data_c or data_aj,
+                "urgencia":  "—",
+                "link":      stj_link(numero),
+                "tipo":      "concluso",
+            })
+        time.sleep(0.3)
+ 
     pautados.sort(key=lambda x: (
-        {"Alta": 0, "Média": 1, "Baixa": 2}.get(x["urgencia"], 3),
-        x["data_sort"]
-    ))
+        {"Alta":0,"Média":1,"Baixa":2}.get(x["urgencia"],3), x["data_sort"]))
     distribuidos.sort(key=lambda x: x["data_sort"], reverse=True)
-    return pautados, distribuidos
+    conclusos.sort(key=lambda x: x["data_sort"], reverse=True)
+    return pautados, distribuidos, conclusos
  
-# ── HTML ──────────────────────────────────────────────────────────────────────
-# IMPORTANTE: usamos string normal (não f-string) para evitar conflito
-# com as chaves {} do CSS e JavaScript. Substituição via .replace().
- 
-HTML_TEMPLATE = """<!DOCTYPE html>
+# ── Geração de arquivos ───────────────────────────────────────────────────────
+HTML = '''<!DOCTYPE html>
 <html lang="pt-BR">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Monitor STJ · Marquez Advogados</title>
+<title>Monitor STJ - Marquez Advogados</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 :root{
   --bg:#0f1117;--sur:#1a1d2e;--sur2:#22263a;--bdr:#2e3250;
   --acc:#6c7bff;--text:#e2e8f0;--mut:#8892b0;
-  --alt:#f87171;--med:#fbbf24;--ok:#4ade80;--inf:#60a5fa;
-  --font:'Inter',system-ui,sans-serif
+  --alt:#f87171;--med:#fbbf24;--ok:#4ade80;--inf:#60a5fa;--warn:#fb923c
 }
-body{background:var(--bg);color:var(--text);font-family:var(--font);font-size:14px}
-header{
-  background:var(--sur);border-bottom:1px solid var(--bdr);
-  padding:18px 32px;display:flex;align-items:center;
-  justify-content:space-between;gap:12px;flex-wrap:wrap
-}
-.logo-wrap{display:flex;align-items:center;gap:12px}
-.logo-box{width:36px;height:36px;background:var(--acc);border-radius:9px;
-  display:grid;place-items:center;font-size:17px}
-.logo-wrap h1{font-size:16px;font-weight:700}
-.logo-wrap p{font-size:11px;color:var(--mut);margin-top:1px}
-.badge-up{
-  background:var(--sur2);border:1px solid var(--bdr);border-radius:8px;
-  padding:5px 12px;font-size:11px;color:var(--mut);display:flex;
-  align-items:center;gap:6px
-}
-.dot{width:7px;height:7px;border-radius:50%;background:var(--ok);
-  animation:pulse 2s infinite}
+body{background:var(--bg);color:var(--text);font-family:system-ui,sans-serif;font-size:14px}
+header{background:var(--sur);border-bottom:1px solid var(--bdr);padding:18px 28px;
+  display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}
+.lw{display:flex;align-items:center;gap:12px}
+.lb{width:36px;height:36px;background:var(--acc);border-radius:9px;display:grid;place-items:center;font-size:18px}
+.lw h1{font-size:16px;font-weight:700}
+.lw p{font-size:11px;color:var(--mut)}
+.upd{background:var(--sur2);border:1px solid var(--bdr);border-radius:8px;
+  padding:5px 12px;font-size:11px;color:var(--mut);display:flex;align-items:center;gap:6px}
+.dot{width:7px;height:7px;border-radius:50%;background:var(--ok);animation:pulse 2s infinite}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
-.cards{
-  display:grid;grid-template-columns:repeat(auto-fill,minmax(148px,1fr));
-  gap:12px;padding:22px 32px
-}
-.card{
-  background:var(--sur);border:1px solid var(--bdr);border-radius:12px;
-  padding:14px;position:relative;overflow:hidden
-}
-.c-lbl{font-size:10px;color:var(--mut);text-transform:uppercase;letter-spacing:.7px;margin-bottom:6px}
-.c-val{font-size:26px;font-weight:800;line-height:1}
-.c-bar{position:absolute;bottom:0;left:0;right:0;height:3px;border-radius:0 0 12px 12px}
-.ca .c-val{color:var(--acc)} .ca .c-bar{background:var(--acc)}
-.cd .c-val{color:var(--alt)} .cd .c-bar{background:var(--alt)}
-.cm .c-val{color:var(--med)} .cm .c-bar{background:var(--med)}
-.cb .c-val{color:var(--ok)}  .cb .c-bar{background:var(--ok)}
-.ci .c-val{color:var(--inf)} .ci .c-bar{background:var(--inf)}
-.tabs{
-  display:flex;gap:4px;padding:0 32px;
-  border-bottom:1px solid var(--bdr);margin-top:4px
-}
-.tab{
-  padding:8px 16px;border-radius:8px 8px 0 0;cursor:pointer;
-  font-size:13px;font-weight:500;color:var(--mut);
-  border:1px solid transparent;border-bottom:none;background:transparent
-}
-.tab.on{
-  background:var(--sur);border-color:var(--bdr);
-  border-bottom:1px solid var(--sur);color:var(--text);margin-bottom:-1px
-}
+.cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:10px;padding:20px 28px}
+.card{background:var(--sur);border:1px solid var(--bdr);border-radius:10px;padding:13px;position:relative;overflow:hidden}
+.cl{font-size:10px;color:var(--mut);text-transform:uppercase;letter-spacing:.6px;margin-bottom:5px}
+.cv{font-size:24px;font-weight:800;line-height:1}
+.cb2{position:absolute;bottom:0;left:0;right:0;height:3px}
+.ct .cv{color:var(--acc)} .ct .cb2{background:var(--acc)}
+.ca .cv{color:var(--alt)}  .ca .cb2{background:var(--alt)}
+.cm .cv{color:var(--med)}  .cm .cb2{background:var(--med)}
+.cg .cv{color:var(--ok)}   .cg .cb2{background:var(--ok)}
+.ci .cv{color:var(--inf)}  .ci .cb2{background:var(--inf)}
+.cw .cv{color:var(--warn)} .cw .cb2{background:var(--warn)}
+.tabs{display:flex;gap:3px;padding:0 28px;border-bottom:1px solid var(--bdr)}
+.tab{padding:8px 14px;border-radius:8px 8px 0 0;cursor:pointer;font-size:13px;
+  font-weight:500;color:var(--mut);border:1px solid transparent;border-bottom:none;background:transparent}
+.tab.on{background:var(--sur);border-color:var(--bdr);border-bottom:1px solid var(--sur);
+  color:var(--text);margin-bottom:-1px}
 .tab:hover:not(.on){background:var(--sur2);color:var(--text)}
-.bar{
-  display:flex;align-items:center;gap:10px;flex-wrap:wrap;
-  padding:14px 32px;background:var(--sur);border-bottom:1px solid var(--bdr)
-}
-.sw{position:relative;flex:1;min-width:180px;max-width:320px}
-.sw input{
-  width:100%;background:var(--sur2);border:1px solid var(--bdr);
-  border-radius:8px;padding:7px 10px 7px 30px;color:var(--text);
-  font-size:13px;outline:none
-}
+.bar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:12px 28px;
+  background:var(--sur);border-bottom:1px solid var(--bdr)}
+.sw{position:relative;flex:1;min-width:160px;max-width:300px}
+.sw input{width:100%;background:var(--sur2);border:1px solid var(--bdr);border-radius:7px;
+  padding:7px 10px 7px 28px;color:var(--text);font-size:13px;outline:none}
 .sw input:focus{border-color:var(--acc)}
-.sw::before{content:"🔍";position:absolute;left:9px;top:50%;transform:translateY(-50%);font-size:11px}
-select{
-  background:var(--sur2);border:1px solid var(--bdr);border-radius:8px;
-  color:var(--text);padding:7px 10px;font-size:13px;cursor:pointer;outline:none
-}
-.cnt{
-  margin-left:auto;background:var(--sur2);border:1px solid var(--bdr);
-  border-radius:6px;padding:4px 10px;font-size:11px;color:var(--mut);white-space:nowrap
-}
-.twrap{overflow-x:auto;padding:0 32px 40px}
-table{width:100%;border-collapse:collapse;margin-top:14px}
-thead th{
-  text-align:left;padding:9px 10px;font-size:10px;font-weight:600;
-  color:var(--mut);text-transform:uppercase;letter-spacing:.6px;
-  border-bottom:1px solid var(--bdr);white-space:nowrap;cursor:pointer
-}
-thead th:hover{color:var(--text)}
-.sa::after{content:" ▲";color:var(--acc)} .sd::after{content:" ▼";color:var(--acc)}
-tbody tr{border-bottom:1px solid var(--bdr);transition:background .1s}
+.sw::before{content:"?";position:absolute;left:9px;top:50%;transform:translateY(-50%);font-size:11px;color:var(--mut)}
+select{background:var(--sur2);border:1px solid var(--bdr);border-radius:7px;
+  color:var(--text);padding:7px 10px;font-size:13px;cursor:pointer;outline:none}
+.cnt{margin-left:auto;background:var(--sur2);border:1px solid var(--bdr);
+  border-radius:6px;padding:4px 10px;font-size:11px;color:var(--mut);white-space:nowrap}
+.notice{background:var(--sur2);border-left:3px solid var(--warn);margin:12px 28px;
+  padding:8px 14px;border-radius:0 7px 7px 0;font-size:12px;color:var(--mut)}
+.twrap{overflow-x:auto;padding:0 28px 40px}
+table{width:100%;border-collapse:collapse;margin-top:12px}
+th{text-align:left;padding:8px 10px;font-size:10px;font-weight:600;color:var(--mut);
+  text-transform:uppercase;letter-spacing:.5px;border-bottom:1px solid var(--bdr);
+  white-space:nowrap;cursor:pointer;user-select:none}
+th:hover{color:var(--text)}
+th.sa::after{content:" a";color:var(--acc)} th.sd::after{content:" v";color:var(--acc)}
+tr{border-bottom:1px solid var(--bdr)}
 tbody tr:hover{background:var(--sur2)}
-tbody td{padding:11px 10px;vertical-align:top}
-.num{color:var(--acc);text-decoration:none;font-weight:600;font-size:13px;white-space:nowrap}
-.num:hover{color:#a78bfa;text-decoration:underline}
-.bp{
-  display:inline-block;padding:2px 8px;border-radius:20px;
-  font-size:11px;font-weight:600;white-space:nowrap
-}
-.u-Alta{background:rgba(248,113,113,.15);color:#f87171;border:1px solid rgba(248,113,113,.3)}
-.u-Media{background:rgba(251,191,36,.15);color:#fbbf24;border:1px solid rgba(251,191,36,.3)}
-.u-Baixa{background:rgba(74,222,128,.15);color:#4ade80;border:1px solid rgba(74,222,128,.3)}
-.u-dist{background:rgba(96,165,250,.1);color:#60a5fa;border:1px solid rgba(96,165,250,.2)}
-.orgpill{
-  display:inline-block;padding:2px 8px;border-radius:6px;font-size:11px;
-  background:var(--sur2);border:1px solid var(--bdr);color:var(--mut)
-}
-.muted{font-size:12px;color:var(--mut);max-width:260px}
-.empty{text-align:center;padding:60px 20px;color:var(--mut)}
-.empty .ico{font-size:36px;margin-bottom:10px}
+td{padding:10px 10px;vertical-align:top;font-size:13px}
+.nl{color:var(--acc);text-decoration:none;font-weight:600;white-space:nowrap}
+.nl:hover{color:#a78bfa;text-decoration:underline}
+.bp{display:inline-block;padding:2px 8px;border-radius:20px;font-size:11px;font-weight:600;white-space:nowrap}
+.uA{background:rgba(248,113,113,.15);color:#f87171;border:1px solid rgba(248,113,113,.3)}
+.uM{background:rgba(251,191,36,.15);color:#fbbf24;border:1px solid rgba(251,191,36,.3)}
+.uB{background:rgba(74,222,128,.15);color:#4ade80;border:1px solid rgba(74,222,128,.3)}
+.uD{background:rgba(96,165,250,.1);color:#60a5fa;border:1px solid rgba(96,165,250,.2)}
+.op{display:inline-block;padding:2px 7px;border-radius:5px;font-size:11px;
+  background:var(--sur2);border:1px solid var(--bdr);color:var(--mut)}
+.mt{font-size:12px;color:var(--mut);max-width:240px}
+.empty{text-align:center;padding:50px 20px;color:var(--mut)}
 ::-webkit-scrollbar{width:5px;height:5px}
 ::-webkit-scrollbar-track{background:var(--bg)}
 ::-webkit-scrollbar-thumb{background:var(--bdr);border-radius:3px}
-@media(max-width:700px){
-  header,.cards,.tabs,.bar,.twrap{padding-left:14px;padding-right:14px}
-}
+@media(max-width:680px){header,.cards,.tabs,.bar,.twrap{padding-left:12px;padding-right:12px}}
 </style>
 </head>
 <body>
- 
 <header>
-  <div class="logo-wrap">
-    <div class="logo-box">&#x2696;&#xFE0F;</div>
-    <div>
-      <h1>Monitor STJ</h1>
-      <p>Marquez Advogados &middot; Prospec&ccedil;&atilde;o Ativa</p>
-    </div>
+  <div class="lw">
+    <div class="lb">&#9878;</div>
+    <div><h1>Monitor STJ</h1><p>Marquez Advogados &middot; Prospec&ccedil;&atilde;o Ativa</p></div>
   </div>
-  <div class="badge-up">
-    <span class="dot"></span>
-    Atualizado em <strong style="margin-left:4px">__ATUALIZADO__</strong>
-  </div>
+  <div class="upd"><span class="dot"></span>Atualizado em <strong id="upd-txt" style="margin-left:4px"></strong></div>
 </header>
- 
-<div class="cards">
-  <div class="card ca"><div class="c-lbl">Total</div><div class="c-val">__TOTAL__</div><div class="c-bar"></div></div>
-  <div class="card cd"><div class="c-lbl">Alta urg&ecirc;ncia</div><div class="c-val">__ALTA__</div><div class="c-bar"></div></div>
-  <div class="card cm"><div class="c-lbl">M&eacute;dia urg&ecirc;ncia</div><div class="c-val">__MEDIA__</div><div class="c-bar"></div></div>
-  <div class="card cb"><div class="c-lbl">Baixa urg&ecirc;ncia</div><div class="c-val">__BAIXA__</div><div class="c-bar"></div></div>
-  <div class="card ci"><div class="c-lbl">Distribu&iacute;dos 45d</div><div class="c-val">__NDIST__</div><div class="c-bar"></div></div>
-  <div class="card ca"><div class="c-lbl">3&ordf; Turma</div><div class="c-val">__N3T__</div><div class="c-bar"></div></div>
-  <div class="card ca"><div class="c-lbl">4&ordf; Turma</div><div class="c-val">__N4T__</div><div class="c-bar"></div></div>
-  <div class="card ca"><div class="c-lbl">Corte Especial</div><div class="c-val">__NCE__</div><div class="c-bar"></div></div>
-</div>
- 
-<div class="tabs">
-  <div class="tab on"  onclick="mudarTab('pautado',this)">&#x1F4CB; Pautados (__NPAUT__)</div>
-  <div class="tab"     onclick="mudarTab('distribuido',this)">&#x1F4E8; Distribu&iacute;dos (__NDIST__)</div>
-  <div class="tab"     onclick="mudarTab('todos',this)">&#x1F4C2; Todos (__TOTAL__)</div>
-</div>
- 
+<div class="cards" id="cards"></div>
+<div class="tabs" id="tabs"></div>
 <div class="bar">
-  <div class="sw"><input id="q" type="text" placeholder="N&uacute;mero, ministro, assunto&hellip;" oninput="render()"></div>
+  <div class="sw"><input id="q" type="text" placeholder="N&uacute;mero, ministro, assunto..." oninput="render()"></div>
   <select id="fo" onchange="render()">
     <option value="">Todos os &oacute;rg&atilde;os</option>
     <option>3&ordf; Turma</option><option>4&ordf; Turma</option><option>Corte Especial</option>
@@ -492,55 +433,86 @@ tbody td{padding:11px 10px;vertical-align:top}
   <select id="fa" onchange="render()"><option value="">Todas as &aacute;reas</option></select>
   <select id="fu" onchange="render()">
     <option value="">Todas urg&ecirc;ncias</option>
-    <option value="Alta">Alta</option>
-    <option value="Media">M&eacute;dia</option>
-    <option value="Baixa">Baixa</option>
+    <option value="Alta">Alta</option><option value="Media">M&eacute;dia</option><option value="Baixa">Baixa</option>
   </select>
-  <span class="cnt" id="cnt">carregando&hellip;</span>
+  <span class="cnt" id="cnt">carregando...</span>
 </div>
- 
-<div class="twrap">
-  <table><thead id="th"></thead><tbody id="tb"></tbody></table>
-  <div class="empty" id="emp" style="display:none">
-    <div class="ico">&#x1F50D;</div><p>Nenhum processo com esses filtros.</p>
-  </div>
-</div>
- 
-<!-- Dados injetados em tag separada para evitar conflito com </script> no texto jurídico -->
-<script type="application/json" id="dados-stj">__DADOS_JSON__</script>
+<div id="notice" class="notice" style="display:none"></div>
+<div class="twrap"><table><thead id="th"></thead><tbody id="tb"></tbody></table>
+<div class="empty" id="emp" style="display:none">Nenhum processo com esses filtros.</div></div>
  
 <script>
-var DADOS = JSON.parse(document.getElementById("dados-stj").textContent);
+var META = {atualizado:"__ATUALIZADO__"};
+var tabAtual = "pautado", sCol = "data_sort", sDir = -1;
+var DADOS = [];
  
-var tabAtual = "pautado";
-var sCol = "data_sort";
-var sDir = -1;
- 
-var COLS_PAUT = [
-  {k:"numero",l:"N\u00famero"},
-  {k:"orgao",l:"\u00d3rg\u00e3o"},
-  {k:"ministro",l:"Ministro/a"},
-  {k:"area",l:"\u00c1rea"},
-  {k:"assuntos",l:"Assuntos"},
-  {k:"data_pauta",l:"Data Pauta"},
-  {k:"urgencia",l:"Urg\u00eancia"}
+var TABS = [
+  {id:"pautado",    label:"Pautados"},
+  {id:"distribuido",label:"Distribu&iacute;dos"},
+  {id:"concluso",   label:"Conclusos"},
+  {id:"todos",      label:"Todos"}
 ];
-var COLS_DIST = [
-  {k:"numero",l:"N\u00famero"},
-  {k:"orgao",l:"\u00d3rg\u00e3o"},
-  {k:"ministro",l:"Ministro/a"},
-  {k:"area",l:"\u00c1rea"},
-  {k:"assuntos",l:"Assuntos"},
-  {k:"data_dist",l:"Distribu\u00eddo em"}
-];
+var COLS_P = ["numero","orgao","ministro","area","assuntos","data_ref","urgencia"];
+var COLS_D = ["numero","orgao","ministro","area","assuntos","data_ref"];
+var LABELS = {numero:"N\u00famero",orgao:"\u00d3rg\u00e3o",ministro:"Ministro/a",
+  area:"\u00c1rea",assuntos:"Assuntos",data_ref:"Data Ref.",urgencia:"Urg\u00eancia"};
  
-function mudarTab(t, el) {
-  tabAtual = t;
-  var tabs = document.querySelectorAll(".tab");
-  for (var i=0; i<tabs.length; i++) tabs[i].classList.remove("on");
-  el.classList.add("on");
-  sCol = "data_sort"; sDir = -1;
-  render();
+document.getElementById("upd-txt").textContent = META.atualizado;
+ 
+function buildTabs() {
+  var el = document.getElementById("tabs");
+  TABS.forEach(function(t) {
+    var d = document.createElement("div");
+    d.className = "tab" + (t.id === tabAtual ? " on" : "");
+    d.innerHTML = t.label + ' (<span class="tc-' + t.id + '">...</span>)';
+    d.onclick = function() {
+      tabAtual = t.id; sCol = "data_sort"; sDir = -1;
+      document.querySelectorAll(".tab").forEach(function(x){x.classList.remove("on");});
+      d.classList.add("on");
+      render();
+    };
+    el.appendChild(d);
+  });
+}
+ 
+function updateTabCounts() {
+  ["pautado","distribuido","concluso","todos"].forEach(function(t) {
+    var n = t === "todos" ? DADOS.length : DADOS.filter(function(p){return p.tipo===t;}).length;
+    var els = document.querySelectorAll(".tc-" + t);
+    els.forEach(function(e){e.textContent = n;});
+  });
+}
+ 
+function buildCards() {
+  var p = DADOS.filter(function(x){return x.tipo==="pautado";});
+  var d = DADOS.filter(function(x){return x.tipo==="distribuido";});
+  var c = DADOS.filter(function(x){return x.tipo==="concluso";});
+  var by = function(t,v){return DADOS.filter(function(x){return x[t]===v;}).length;};
+  var cards = [
+    {cls:"ct",lbl:"Total",val:DADOS.length},
+    {cls:"ca",lbl:"Alta Urg\u00eancia",val:p.filter(function(x){return x.urgencia==="Alta";}).length},
+    {cls:"cm",lbl:"M\u00e9dia Urg\u00eancia",val:p.filter(function(x){return x.urgencia==="M\u00e9dia";}).length},
+    {cls:"cg",lbl:"Baixa Urg\u00eancia",val:p.filter(function(x){return x.urgencia==="Baixa";}).length},
+    {cls:"ci",lbl:"Distribu\u00eddos 45d",val:d.length},
+    {cls:"cw",lbl:"Conclusos",val:c.length},
+    {cls:"ct",lbl:"3\u00aa Turma",val:by("orgao","3\u00aa Turma")},
+    {cls:"ct",lbl:"4\u00aa Turma",val:by("orgao","4\u00aa Turma")},
+    {cls:"ct",lbl:"Corte Especial",val:by("orgao","Corte Especial")},
+  ];
+  document.getElementById("cards").innerHTML = cards.map(function(c){
+    return '<div class="card '+c.cls+'"><div class="cl">'+c.lbl+'</div>'+
+           '<div class="cv">'+c.val+'</div><div class="cb2"></div></div>';
+  }).join("");
+}
+ 
+function buildAreaFilter() {
+  var seen = {}, areas = [];
+  DADOS.forEach(function(p){if(!seen[p.area]){seen[p.area]=true;areas.push(p.area);}});
+  areas.sort();
+  var sel = document.getElementById("fa");
+  areas.forEach(function(a){
+    var o = document.createElement("option"); o.value=a; o.text=a; sel.appendChild(o);
+  });
 }
  
 function filtrado() {
@@ -553,161 +525,120 @@ function filtrado() {
     if (fo && p.orgao !== fo) return false;
     if (fa && p.area  !== fa) return false;
     if (fu) {
-      var urg = p.urgencia === "M\u00e9dia" ? "Media" : p.urgencia;
-      if (urg !== fu) return false;
+      var u = p.urgencia === "M\u00e9dia" ? "Media" : p.urgencia;
+      if (u !== fu) return false;
     }
     if (q) {
-      var h = [p.numero, p.ministro, p.assuntos, p.area, p.orgao].join(" ").toLowerCase();
-      if (h.indexOf(q) === -1) return false;
+      var hay = [p.numero,p.ministro,p.assuntos,p.area,p.orgao].join(" ").toLowerCase();
+      if (hay.indexOf(q) < 0) return false;
     }
     return true;
   });
 }
  
 function ordenado(arr) {
-  return arr.slice().sort(function(a, b) {
-    var va = a[sCol] || "", vb = b[sCol] || "";
-    return sDir * (va > vb ? 1 : va < vb ? -1 : 0);
+  return arr.slice().sort(function(a,b){
+    var va=a[sCol]||"", vb=b[sCol]||"";
+    return sDir*(va>vb?1:va<vb?-1:0);
   });
 }
  
-function setSort(col) {
-  if (sCol === col) { sDir *= -1; } else { sCol = col; sDir = -1; }
-  render();
-}
- 
 function badge(u) {
-  if (u === "Alta")  return '<span class="bp u-Alta">&#x1F534; Alta</span>';
-  if (u === "M\u00e9dia") return '<span class="bp u-Media">&#x1F7E1; M\u00e9dia</span>';
-  if (u === "Baixa") return '<span class="bp u-Baixa">&#x1F7E2; Baixa</span>';
-  return '<span class="bp u-dist">&#x1F4E8; Dist.</span>';
+  if (u==="Alta")  return '<span class="bp uA">Alta</span>';
+  if (u==="M\u00e9dia") return '<span class="bp uM">M\u00e9dia</span>';
+  if (u==="Baixa") return '<span class="bp uB">Baixa</span>';
+  return '<span class="bp uD">-</span>';
 }
  
 function render() {
   var rows = ordenado(filtrado());
-  var cols = (tabAtual === "distribuido") ? COLS_DIST : COLS_PAUT;
- 
-  var thHTML = "<tr>";
-  for (var i=0; i<cols.length; i++) {
-    var c = cols[i];
-    var cl = (sCol === c.k) ? (sDir === -1 ? "sd" : "sa") : "";
-    thHTML += '<th class="' + cl + '" onclick="setSort(\'' + c.k + '\')">' + c.l + '</th>';
-  }
-  thHTML += "</tr>";
-  document.getElementById("th").innerHTML = thHTML;
- 
+  var cols = (tabAtual==="pautado" || tabAtual==="todos") ? COLS_P : COLS_D;
+  var thead = "<tr>";
+  cols.forEach(function(k){
+    var cl = sCol===k ? (sDir===-1?"sd":"sa") : "";
+    thead += '<th class="'+cl+'" onclick="ss(\''+k+'\')">'+LABELS[k]+"</th>";
+  });
+  thead += "</tr>";
+  document.getElementById("th").innerHTML = thead;
   var emp = document.getElementById("emp");
   if (!rows.length) {
-    document.querySelector("table").style.display = "none";
-    emp.style.display = "block";
-    document.getElementById("cnt").textContent = "0 processos";
+    document.querySelector("table").style.display="none";
+    emp.style.display="block";
+    document.getElementById("cnt").textContent="0 processos";
     return;
   }
-  document.querySelector("table").style.display = "table";
-  emp.style.display = "none";
-  document.getElementById("cnt").textContent = rows.length + " processo" + (rows.length !== 1 ? "s" : "");
- 
-  var tbHTML = "";
-  for (var r=0; r<rows.length; r++) {
-    var p = rows[r];
-    var useCols = (p.tipo === "distribuido" && tabAtual !== "pautado") ? COLS_DIST : COLS_PAUT;
-    tbHTML += "<tr>";
-    for (var j=0; j<useCols.length; j++) {
-      var ck = useCols[j].k;
-      if (ck === "numero") {
-        tbHTML += '<td><a class="num" href="' + p.link + '" target="_blank">' + p.numero + '</a></td>';
-      } else if (ck === "orgao") {
-        tbHTML += '<td><span class="orgpill">' + p.orgao + '</span></td>';
-      } else if (ck === "urgencia") {
-        tbHTML += '<td>' + badge(p.urgencia) + '</td>';
-      } else if (ck === "assuntos") {
-        var txt = (p.assuntos || "");
-        var short = txt.length > 70 ? txt.slice(0, 70) + "\u2026" : txt;
-        tbHTML += '<td class="muted" title="' + txt + '">' + (short || "\u2014") + '</td>';
-      } else {
-        tbHTML += '<td>' + (p[ck] || "\u2014") + '</td>';
+  document.querySelector("table").style.display="table";
+  emp.style.display="none";
+  document.getElementById("cnt").textContent=rows.length+" processo"+(rows.length!==1?"s":"");
+  var useCols = (tabAtual==="pautado") ? COLS_P : (tabAtual==="todos" ? COLS_P : COLS_D);
+  var html = "";
+  rows.forEach(function(p){
+    var c2 = (p.tipo==="distribuido"||p.tipo==="concluso") && tabAtual!=="pautado" && tabAtual!=="todos" ? COLS_D : COLS_P;
+    html += "<tr>";
+    c2.forEach(function(k){
+      if (k==="numero")   html += '<td><a class="nl" href="'+p.link+'" target="_blank">'+p.numero+'</a></td>';
+      else if (k==="orgao")    html += '<td><span class="op">'+p.orgao+'</span></td>';
+      else if (k==="urgencia") html += '<td>'+badge(p.urgencia)+'</td>';
+      else if (k==="assuntos") {
+        var t=p.assuntos||""; var s=t.length>65?t.slice(0,65)+"...":t;
+        html += '<td class="mt" title="'+t+'">'+(s||"-")+'</td>';
       }
-    }
-    tbHTML += "</tr>";
-  }
-  document.getElementById("tb").innerHTML = tbHTML;
+      else html += '<td>'+(p[k]||"-")+'</td>';
+    });
+    html += "</tr>";
+  });
+  document.getElementById("tb").innerHTML = html;
 }
  
-function initAreas() {
-  var areas = [];
-  var seen = {};
-  for (var i=0; i<DADOS.length; i++) {
-    var a = DADOS[i].area;
-    if (!seen[a]) { seen[a] = true; areas.push(a); }
-  }
-  areas.sort();
-  var sel = document.getElementById("fa");
-  for (var i=0; i<areas.length; i++) {
-    var o = document.createElement("option");
-    o.value = areas[i]; o.text = areas[i];
-    sel.appendChild(o);
-  }
-}
+function ss(col){sCol===col?sDir*=-1:(sCol=col,sDir=-1);render();}
  
-initAreas();
-render();
+// Carrega dados do arquivo JSON separado — sem injeção no HTML
+fetch("data.json")
+  .then(function(r){
+    if(!r.ok) throw new Error("HTTP "+r.status);
+    return r.json();
+  })
+  .then(function(data){
+    DADOS = data;
+    buildTabs();
+    buildCards();
+    buildAreaFilter();
+    updateTabCounts();
+    render();
+  })
+  .catch(function(err){
+    document.getElementById("cnt").textContent = "Erro ao carregar dados: "+err.message;
+    console.error(err);
+  });
 </script>
 </body>
-</html>"""
+</html>'''
  
  
-def gerar_html(pautados, distribuidos, atualizado):
-    todos   = pautados + distribuidos
-    total   = len(todos)
-    n_alta  = sum(1 for p in pautados if p["urgencia"] == "Alta")
-    n_media = sum(1 for p in pautados if p["urgencia"] == "Média")
-    n_baixa = sum(1 for p in pautados if p["urgencia"] == "Baixa")
-    n_dist  = len(distribuidos)
-    n_3t    = sum(1 for p in todos if p["orgao"] == "3ª Turma")
-    n_4t    = sum(1 for p in todos if p["orgao"] == "4ª Turma")
-    n_ce    = sum(1 for p in todos if p["orgao"] == "Corte Especial")
-    n_paut  = len(pautados)
- 
-    # ensure_ascii=True converte todos os caracteres especiais para \uXXXX
-    # replace('</', '<\/') evita que </script> quebre o HTML parser do navegador
-    dados_json = json.dumps(todos, ensure_ascii=True).replace("</", "<\\/")
- 
- 
-    html = HTML_TEMPLATE
-    html = html.replace("__ATUALIZADO__", atualizado)
-    html = html.replace("__TOTAL__",  str(total))
-    html = html.replace("__ALTA__",   str(n_alta))
-    html = html.replace("__MEDIA__",  str(n_media))
-    html = html.replace("__BAIXA__",  str(n_baixa))
-    html = html.replace("__NDIST__",  str(n_dist))
-    html = html.replace("__N3T__",    str(n_3t))
-    html = html.replace("__N4T__",    str(n_4t))
-    html = html.replace("__NCE__",    str(n_ce))
-    html = html.replace("__NPAUT__",  str(n_paut))
-    html = html.replace("__DADOS_JSON__", dados_json)
-    return html
- 
- 
-# ── Main ──────────────────────────────────────────────────────────────────────
 def main():
-    pautados, distribuidos = coletar()
+    pautados, distribuidos, conclusos = coletar()
+    todos = pautados + distribuidos + conclusos
  
-    log(f"Pautados: {len(pautados)} | "
-        f"Alta: {sum(1 for p in pautados if p['urgencia']=='Alta')} | "
-        f"Média: {sum(1 for p in pautados if p['urgencia']=='Média')} | "
+    log(f"Pautados: {len(pautados)} | Alta: {sum(1 for p in pautados if p['urgencia']=='Alta')} | "
+        f"Media: {sum(1 for p in pautados if p['urgencia']=='Media')} | "
         f"Baixa: {sum(1 for p in pautados if p['urgencia']=='Baixa')}")
-    log(f"Distribuídos (45d): {len(distribuidos)}")
- 
-    # GitHub Actions roda em UTC — converte para BRT (UTC-3)
-    atualizado = (datetime.utcnow() - timedelta(hours=3)).strftime("%d/%m/%Y %H:%M") + " (BRT)"
-    html = gerar_html(pautados, distribuidos, atualizado)
+    log(f"Distribuidos: {len(distribuidos)} | Conclusos: {len(conclusos)} | Total: {len(todos)}")
  
     out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "stj")
     os.makedirs(out_dir, exist_ok=True)
-    out = os.path.join(out_dir, "index.html")
-    with open(out, "w", encoding="utf-8") as f:
+ 
+    # Grava data.json separado — 100% seguro, sem injeção no HTML
+    with open(os.path.join(out_dir, "data.json"), "w", encoding="utf-8") as f:
+        json.dump(todos, f, ensure_ascii=False)
+    log("data.json gravado")
+ 
+    # BRT = UTC-3
+    atualizado = (datetime.utcnow() - timedelta(hours=3)).strftime("%d/%m/%Y %H:%M") + " (BRT)"
+    html = HTML.replace("__ATUALIZADO__", atualizado)
+ 
+    with open(os.path.join(out_dir, "index.html"), "w", encoding="utf-8") as f:
         f.write(html)
-    log(f"HTML gerado com sucesso → {out}")
+    log("index.html gravado")
  
  
 if __name__ == "__main__":
