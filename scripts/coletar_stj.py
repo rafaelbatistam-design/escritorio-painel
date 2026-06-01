@@ -138,21 +138,20 @@ def extrair_assuntos(assuntos):
     return "; ".join(n for n in nomes if n)
  
 def analisar_pauta(movimentos):
-    """Igual ao notebook: retorna (situacao, data_inclusao)."""
+    """
+    Retorna (situacao, data_inclusao).
+    Mantém processo como 'pautado' se teve mov.417 e não houve
+    cancelamento (12106), retirada (897) ou julgamento (193) posterior.
+    Remove restrição de 60 dias na inclusão — o que importa é estar ativo.
+    """
     if not movimentos:
         return "sem_pauta", ""
     movs = sorted(movimentos, key=lambda m: m.get("dataHora", ""))
     ultimo_idx, ultima_data = None, ""
     for i, m in enumerate(movs):
         if m.get("codigo") == MOV_PAUTADO:
-            data_mov = m.get("dataHora", "")[:10]
-            try:
-                dt_mov = datetime.strptime(data_mov, "%Y-%m-%d").date()
-                if (date.today() - dt_mov).days > 60:
-                    continue
-            except:
-                continue
-            ultimo_idx, ultima_data = i, data_mov
+            ultima_data = m.get("dataHora", "")[:10]
+            ultimo_idx  = i
     if ultimo_idx is None:
         return "sem_pauta", ""
     for m in movs[ultimo_idx + 1:]:
@@ -669,7 +668,10 @@ def gerar_html(pautados, distribuidos, atualizado):
     n_ce    = sum(1 for p in todos if p["orgao"] == "Corte Especial")
     n_paut  = len(pautados)
  
-    dados_json = json.dumps(todos, ensure_ascii=False)
+    # ensure_ascii=True converte todos os caracteres especiais para \uXXXX
+    # replace('</', '<\/') evita que </script> quebre o HTML parser do navegador
+    dados_json = json.dumps(todos, ensure_ascii=True).replace("</", "<\\/")
+ 
  
     html = HTML_TEMPLATE
     html = html.replace("__ATUALIZADO__", atualizado)
