@@ -507,8 +507,11 @@ tbody td{padding:11px 10px;vertical-align:top}
   </div>
 </div>
  
+<!-- Dados injetados em tag separada para evitar conflito com </script> no texto jurídico -->
+<script type="application/json" id="dados-stj">__DADOS_JSON__</script>
+ 
 <script>
-var DADOS = __DADOS_JSON__;
+var DADOS = JSON.parse(document.getElementById("dados-stj").textContent);
  
 var tabAtual = "pautado";
 var sCol = "data_sort";
@@ -693,7 +696,8 @@ def main():
         f"Baixa: {sum(1 for p in pautados if p['urgencia']=='Baixa')}")
     log(f"Distribuídos (45d): {len(distribuidos)}")
  
-    atualizado = datetime.now().strftime("%d/%m/%Y %H:%M")
+    # GitHub Actions roda em UTC — converte para BRT (UTC-3)
+    atualizado = (datetime.utcnow() - timedelta(hours=3)).strftime("%d/%m/%Y %H:%M") + " (BRT)"
     html = gerar_html(pautados, distribuidos, atualizado)
  
     out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "stj")
