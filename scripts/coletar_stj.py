@@ -61,8 +61,24 @@ NOMES_MOV = {
     901:   "Sustentação Oral",
 }
  
-# Classes criminais — excluir
-CLASSES_CRIMINAIS = {"HC","RHC","APn","Inq","QCr","Pet"}
+# Classes criminais — excluir pela sigla da classe
+CLASSES_CRIMINAIS = {"HC","RHC","APn","Inq","QCr","Pet","CC","EDcl no HC","AgRg no HC"}
+ 
+# Palavras nos assuntos CNJ que indicam matéria penal — filtra REsp/AREsp criminais
+ASSUNTOS_CRIMINAIS = [
+    "direito penal","direito processual penal","crime","delito","tráfico",
+    "homicídio","furto","roubo","estelionato","receptação","peculato",
+    "corrupção passiva","corrupção ativa","lavagem de dinheiro",
+    "organização criminosa","lesão corporal","ameaça","extorsão","sequestro",
+    "pena privativa","regime prisional","progressão de regime","execução penal",
+    "prisão preventiva","flagrante","inquérito policial","denúncia criminal",
+    "habeas corpus","liberdade provisória","absolvição","condenação penal",
+]
+ 
+# Nomes de órgão julgador que indicam câmara/turma criminal
+ORGAOS_CRIMINAIS = [
+    "quinta turma","sexta turma","terceira seção","turma criminal","seção criminal",
+]
  
 # Classificação de área — mapeamento ampliado, hierarquia por especificidade
 AREAS = [
@@ -171,28 +187,44 @@ def classificar_area(texto):
     return "Outros"
  
 def extrair_assuntos(assuntos):
-    if not assuntos: return ""
+    """Retorna (string_display, lista_nomes) com todos os assuntos do processo."""
+    if not assuntos: return "", []
     nomes = []
-    for a in assuntos[:6]:
-        if isinstance(a, dict): nomes.append(a.get("nome",""))
-        elif isinstance(a, str): nomes.append(a)
-    return "; ".join(n for n in nomes if n)
+    for a in assuntos:
+        if isinstance(a, dict):
+            n = a.get("nome","").strip()
+            if n: nomes.append(n)
+        elif isinstance(a, str) and a.strip():
+            nomes.append(a.strip())
+    return "; ".join(nomes[:6]), nomes
  
 def extrair_classe(src):
     c = src.get("classe",{})
     return (c.get("nome","") if isinstance(c, dict) else "") or ""
  
-def is_criminal(nome_classe):
+def is_criminal(nome_classe, assuntos_txt="", orgao_nome=""):
     sigla = (nome_classe or "").split()[0]
-    return sigla in CLASSES_CRIMINAIS
+    if sigla in CLASSES_CRIMINAIS:
+        return True
+    t = assuntos_txt.lower()
+    if any(k in t for k in ASSUNTOS_CRIMINAIS):
+        return True
+    o = orgao_nome.lower()
+    if any(k in o for k in ORGAOS_CRIMINAIS):
+        return True
+    return False
  
 def ultimo_andamento(movimentos):
-    """Retorna (codigo, nome, data) do movimento mais recente."""
-    if not movimentos: return "", "Sem andamento", ""
+    """Retorna (codigo, nome, data) do movimento mais recente.
+    Usa o campo 'nome' da API se disponível, senão NOMES_MOV, senão código."""
+    if not movimentos: return 0, "Sem andamento", ""
     movs = sorted(movimentos, key=lambda m: m.get("dataHora",""), reverse=True)
     m = movs[0]
     cod  = m.get("codigo", 0)
-    nome = NOMES_MOV.get(cod, f"Movimento {cod}")
+    # Datajud retorna o nome do movimento na própria resposta
+    nome = (m.get("nome") or "").strip()
+    if not nome:
+        nome = NOMES_MOV.get(cod, f"Movimento {cod}")
     data = m.get("dataHora","")[:10]
     return cod, nome, data
  
@@ -270,28 +302,30 @@ def coletar():
             src    = hit.get("_source",{})
             numero = src.get("numeroProcesso","")
             if numero in vistos: continue
-            classe = extrair_classe(src)
-            if is_criminal(classe): continue
-            assuntos = extrair_assuntos(src.get("assuntos",[]))
-            area     = classificar_area(assuntos)
+            classe     = extrair_classe(src)
             movimentos = src.get("movimentos",[])
+            orgao_hit  = src.get("orgaoJulgador",{}).get("nome","") if isinstance(src.get("orgaoJulgador"),dict) else ""
+            assuntos_str, assuntos_lista = extrair_assuntos(src.get("assuntos",[]))
+            if is_criminal(classe, assuntos_str, orgao_hit): continue
+            area      = classificar_area(assuntos_str)
             _, ult_nome, ult_data = ultimo_andamento(movimentos)
             data_dist = data_mais_recente_mov(movimentos, MOV_DISTRIBUIDO)
             data_aj   = src.get("dataAjuizamento","")[:10]
             vistos.add(numero)
             distribuidos.append({
-                "numero":       numero,
-                "classe":       classe,
-                "orgao":        orgao,
-                "ministro":     ministro,
-                "area":         area,
-                "assuntos":     assuntos,
-                "data_dist":    fmt(data_dist or data_aj),
-                "data_sort":    data_dist or data_aj,
-                "data_ult":     fmt(ult_data),
-                "ult_andamento":ult_nome,
-                "link":         stj_link(numero),
-                "tipo":         "distribuido",
+                "numero":        numero,
+                "classe":        classe,
+                "orgao":         orgao,
+                "ministro":      ministro,
+                "area":          area,
+                "assuntos":      assuntos_str,
+                "assuntos_lista":assuntos_lista,
+                "data_dist":     fmt(data_dist or data_aj),
+                "data_sort":     data_dist or data_aj,
+                "data_ult":      fmt(ult_data),
+                "ult_andamento": ult_nome,
+                "link":          stj_link(numero),
+                "tipo":          "distribuido",
             })
         time.sleep(0.3)
  
@@ -305,11 +339,12 @@ def coletar():
             src    = hit.get("_source",{})
             numero = src.get("numeroProcesso","")
             if numero in vistos: continue
-            classe = extrair_classe(src)
-            if is_criminal(classe): continue
-            assuntos = extrair_assuntos(src.get("assuntos",[]))
-            area     = classificar_area(assuntos)
+            classe     = extrair_classe(src)
             movimentos = src.get("movimentos",[])
+            orgao_hit  = src.get("orgaoJulgador",{}).get("nome","") if isinstance(src.get("orgaoJulgador"),dict) else ""
+            assuntos_str, assuntos_lista = extrair_assuntos(src.get("assuntos",[]))
+            if is_criminal(classe, assuntos_str, orgao_hit): continue
+            area          = classificar_area(assuntos_str)
             _, ult_nome, ult_data = ultimo_andamento(movimentos)
             data_concluso = data_mais_recente_mov(movimentos, MOV_CONCLUSO)
             data_aj       = src.get("dataAjuizamento","")[:10]
@@ -320,7 +355,8 @@ def coletar():
                 "orgao":         orgao,
                 "ministro":      ministro,
                 "area":          area,
-                "assuntos":      assuntos,
+                "assuntos":      assuntos_str,
+                "assuntos_lista":assuntos_lista,
                 "data_concluso": fmt(data_concluso),
                 "data_sort":     data_concluso or data_aj,
                 "data_ult":      fmt(ult_data),
@@ -421,7 +457,7 @@ td{padding:9px 10px;vertical-align:top;font-size:12px}
     <option>3&ordf; Turma</option><option>4&ordf; Turma</option>
   </select>
   <select id="fm" onchange="render()"><option value="">Todos os ministros</option></select>
-  <select id="fa" onchange="render()"><option value="">Todas as &aacute;reas</option></select>
+  <select id="fas" onchange="render()"><option value="">Todos os assuntos CNJ</option></select>
   <span class="cnt" id="cnt">carregando...</span>
 </div>
 <div class="twrap">
@@ -481,12 +517,16 @@ td{padding:9px 10px;vertical-align:top;font-size:12px}
     arr.sort(); var s=document.getElementById(id);
     arr.forEach(function(v){var o=document.createElement("option");o.value=v;o.text=v;s.appendChild(o);});
   }
-  var sm={},sa={},mins=[],areas=[];
+  var sm={},sas={},mins=[],assuntosCNJ=[];
   D.forEach(function(p){
     if(!sm[p.ministro]){sm[p.ministro]=true;mins.push(p.ministro);}
-    if(!sa[p.area]){sa[p.area]=true;areas.push(p.area);}
+    // Coleta todos os assuntos individuais do CNJ
+    (p.assuntos_lista||[]).forEach(function(a){
+      if(a&&!sas[a]){sas[a]=true;assuntosCNJ.push(a);}
+    });
   });
-  pop("fm",mins); pop("fa",areas);
+  pop("fm",mins);
+  pop("fas",assuntosCNJ);
  
   // Colunas por aba
   var COLS_D=["classe","numero","orgao","ministro","area","assuntos","data_dist","andamento_completo"];
@@ -507,17 +547,21 @@ td{padding:9px 10px;vertical-align:top;font-size:12px}
   }
  
   function filtrado(){
-    var q=document.getElementById("q").value.toLowerCase();
-    var fo=document.getElementById("fo").value;
-    var fm=document.getElementById("fm").value;
-    var fa=document.getElementById("fa").value;
+    var q  =document.getElementById("q").value.toLowerCase();
+    var fo =document.getElementById("fo").value;
+    var fm =document.getElementById("fm").value;
+    var fas=document.getElementById("fas").value;
     return D.filter(function(p){
       if(tabAtual!=="todos"&&p.tipo!==tabAtual) return false;
       if(fo&&p.orgao!==fo)    return false;
       if(fm&&p.ministro!==fm) return false;
-      if(fa&&p.area!==fa)     return false;
+      if(fas){
+        // filtra pelo assunto CNJ exato dentro da lista do processo
+        var lista=p.assuntos_lista||[];
+        if(lista.indexOf(fas)<0) return false;
+      }
       if(q){
-        var h=[p.numero,p.ministro,p.assuntos,p.area,p.classe,p.ult_andamento].join(" ").toLowerCase();
+        var h=[p.numero,p.ministro,p.assuntos,p.classe,p.ult_andamento].join(" ").toLowerCase();
         if(h.indexOf(q)<0) return false;
       }
       return true;
