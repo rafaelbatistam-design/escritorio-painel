@@ -64,20 +64,15 @@ NOMES_MOV = {
 # Classes criminais — excluir pela sigla da classe
 CLASSES_CRIMINAIS = {"HC","RHC","APn","Inq","QCr","Pet","CC","EDcl no HC","AgRg no HC"}
  
-# Palavras nos assuntos CNJ que indicam matéria penal — filtra REsp/AREsp criminais
+# Assuntos CNJ de nível raiz que indicam matéria ESTRITAMENTE penal
+# Conservador: só exclui quando o assunto principal for inequivocamente criminal
 ASSUNTOS_CRIMINAIS = [
-    "direito penal","direito processual penal","crime","delito","tráfico",
-    "homicídio","furto","roubo","estelionato","receptação","peculato",
-    "corrupção passiva","corrupção ativa","lavagem de dinheiro",
-    "organização criminosa","lesão corporal","ameaça","extorsão","sequestro",
-    "pena privativa","regime prisional","progressão de regime","execução penal",
-    "prisão preventiva","flagrante","inquérito policial","denúncia criminal",
-    "habeas corpus","liberdade provisória","absolvição","condenação penal",
+    "direito penal","direito processual penal",
 ]
  
-# Nomes de órgão julgador que indicam câmara/turma criminal
+# Nomes de órgão julgador que indicam câmara/turma criminal no STJ
 ORGAOS_CRIMINAIS = [
-    "quinta turma","sexta turma","terceira seção","turma criminal","seção criminal",
+    "quinta turma","sexta turma","terceira seção",
 ]
  
 # Classificação de área — mapeamento ampliado, hierarquia por especificidade
@@ -258,6 +253,26 @@ def post_api(body):
     except Exception as e:
         log(f"  Erro: {e}"); return None
  
+def diagnosticar_campos():
+    """Query minima (1 resultado, sem _source) para listar todos os campos
+    disponiveis. Roda uma vez no inicio — nao afeta a coleta principal."""
+    codigo_ref = sorted(TODOS_CODIGOS)[0]
+    body = {
+        "size": 1,
+        "query": {"term": {"orgaoJulgador.codigo": codigo_ref}},
+        "sort":  [{"dataAjuizamento": {"order": "desc"}}],
+    }
+    dados = post_api(body)
+    if not dados: return
+    hits = dados.get("hits",{}).get("hits",[])
+    if not hits: return
+    src0 = hits[0].get("_source", {})
+    log(f"[DIAG] Campos: {sorted(src0.keys())}")
+    for c in ["tribunal","localidade","siglaTribunal","tribunalOrigem","orgaoOrigem",
+              "localidadeOrigem","uf","estado","origem","siglaTribunalOrigem"]:
+        if c in src0:
+            log(f"[DIAG] Campo de origem encontrado — '{c}': {str(src0[c])[:100]}")
+ 
 def query_paginado(codigo_gabinete, codigo_mov, since_iso=None, paginas=2):
     """Busca até paginas*200 resultados para aumentar o universo."""
     todos_hits = []
@@ -290,6 +305,9 @@ def query_paginado(codigo_gabinete, codigo_mov, since_iso=None, paginas=2):
 def coletar():
     distribuidos, conclusos = [], []
     vistos = set()
+ 
+    log("=== Diagnóstico de campos disponíveis na API ===")
+    diagnosticar_campos()
  
     # ── Distribuídos (mov.26, últimos 60d, 2 páginas = até 400 por ministro) ─
     log("=== Distribuídos (mov.26, 60d, até 400 por ministro) ===")
