@@ -84,7 +84,7 @@ td{padding:9px 10px;vertical-align:top;font-size:12px}
     <option>3&ordf; Turma</option><option>4&ordf; Turma</option>
   </select>
   <select id="fm" onchange="render()"><option value="">Todos os ministros</option></select>
-  <select id="fa" onchange="render()"><option value="">Todas as &aacute;reas</option></select>
+  <select id="fas" onchange="render()"><option value="">Todos os assuntos CNJ</option></select>
   <span class="cnt" id="cnt">carregando...</span>
 </div>
 <div class="twrap">
@@ -92,7 +92,7 @@ td{padding:9px 10px;vertical-align:top;font-size:12px}
   <div class="empty" id="emp" style="display:none">Nenhum processo com esses filtros.</div>
 </div>
  
-<script src="data.js?v=202606012250"></script>
+<script src="data.js?v=202606012329"></script>
 <script>
 (function(){
   if (!window.STJ_DADOS){
@@ -144,12 +144,16 @@ td{padding:9px 10px;vertical-align:top;font-size:12px}
     arr.sort(); var s=document.getElementById(id);
     arr.forEach(function(v){var o=document.createElement("option");o.value=v;o.text=v;s.appendChild(o);});
   }
-  var sm={},sa={},mins=[],areas=[];
+  var sm={},sas={},mins=[],assuntosCNJ=[];
   D.forEach(function(p){
     if(!sm[p.ministro]){sm[p.ministro]=true;mins.push(p.ministro);}
-    if(!sa[p.area]){sa[p.area]=true;areas.push(p.area);}
+    // Coleta todos os assuntos individuais do CNJ
+    (p.assuntos_lista||[]).forEach(function(a){
+      if(a&&!sas[a]){sas[a]=true;assuntosCNJ.push(a);}
+    });
   });
-  pop("fm",mins); pop("fa",areas);
+  pop("fm",mins);
+  pop("fas",assuntosCNJ);
  
   // Colunas por aba
   var COLS_D=["classe","numero","orgao","ministro","area","assuntos","data_dist","andamento_completo"];
@@ -170,17 +174,21 @@ td{padding:9px 10px;vertical-align:top;font-size:12px}
   }
  
   function filtrado(){
-    var q=document.getElementById("q").value.toLowerCase();
-    var fo=document.getElementById("fo").value;
-    var fm=document.getElementById("fm").value;
-    var fa=document.getElementById("fa").value;
+    var q  =document.getElementById("q").value.toLowerCase();
+    var fo =document.getElementById("fo").value;
+    var fm =document.getElementById("fm").value;
+    var fas=document.getElementById("fas").value;
     return D.filter(function(p){
       if(tabAtual!=="todos"&&p.tipo!==tabAtual) return false;
       if(fo&&p.orgao!==fo)    return false;
       if(fm&&p.ministro!==fm) return false;
-      if(fa&&p.area!==fa)     return false;
+      if(fas){
+        // filtra pelo assunto CNJ exato dentro da lista do processo
+        var lista=p.assuntos_lista||[];
+        if(lista.indexOf(fas)<0) return false;
+      }
       if(q){
-        var h=[p.numero,p.ministro,p.assuntos,p.area,p.classe,p.ult_andamento].join(" ").toLowerCase();
+        var h=[p.numero,p.ministro,p.assuntos,p.classe,p.ult_andamento].join(" ").toLowerCase();
         if(h.indexOf(q)<0) return false;
       }
       return true;
