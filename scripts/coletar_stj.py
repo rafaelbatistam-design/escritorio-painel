@@ -249,7 +249,7 @@ def query_paginado(codigo_gabinete, codigo_mov, since_iso=None, paginas=2):
         hits = dados.get("hits",{}).get("hits",[])
         if pg == 0:
             total = dados.get("hits",{}).get("total",{}).get("value",0)
-            todos_hits._total = total  # guarda para log
+ 
         todos_hits.extend(hits)
         if len(hits) < 200: break   # última página
         time.sleep(0.2)
