@@ -1,2 +1,2 @@
-window.STJ_META={"atualizado": "08/06/2026 11:28 (BRT)"};
+window.STJ_META={"atualizado": "15/06/2026 13:05 (BRT)"};
 window.STJ_DADOS=[];
